@@ -217,10 +217,9 @@ final class AppBanner {
     /// Off-screen рендер образца баннера в PNG (dev-хук визуальной проверки; язык — по L10n.current).
     func renderSample(to path: String) {
         let (content, width, height) = makeContent(
-            title: String(format: L10n.t("upd.notifyTitle"), "0.2.4"), body: L10n.t("upd.notifyBody"),
-            // ⚠️ Цвета КАК В БОЮ (30.07): левая серая, правая коралловая. Раньше образец рисовал
-            // наоборот и тихо врал — визуальную проверку по нему делать было нельзя.
-            actions: [.init(title: L10n.t("upd.now"), coral: false) {}, .init(title: L10n.t("upd.autoShort"), coral: true) {}],
+            title: String(format: L10n.t("upd.notifyTitle"), "0.2.4"),
+            body: String(format: L10n.t("upd.notifyBody"), L10n.t("upd.kindBeta")),
+            actions: [.init(title: L10n.t("upd.review"), coral: true) {}],
             solidDarkBG: true)
         content.appearance = NSAppearance(named: .darkAqua)
         content.frame = NSRect(x: 0, y: 0, width: width, height: height)

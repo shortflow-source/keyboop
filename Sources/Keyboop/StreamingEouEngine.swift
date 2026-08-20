@@ -5,7 +5,7 @@ import FluidAudio
 
 /// ЭКСПЕРИМЕНТАЛЬНО: потоковая диктовка (Parakeet EOU streaming · FluidAudio · CoreML · ANE).
 /// Текст печатается ПО МЕРЕ речи, не дожидаясь конца фразы. Это ОТДЕЛЬНАЯ модель (~120 МБ),
-/// качается ЯВНО при включении тумблера (принцип №2: в рантайме сеть запрещена `enforceOffline`).
+/// качается ЯВНО при включении тумблера (принцип №2: в рантайме сеть запрещена `offlineMode`).
 /// API сверен по исходникам FluidAudio: StreamingEouAsrManager.swift (loadModels/appendAudio/
 /// processBufferedAudio/finish/reset, partial-callback = ПОЛНЫЙ текущий транскрипт), ModelNames.swift.
 final class StreamingEouEngine {
@@ -44,7 +44,7 @@ final class StreamingEouEngine {
 
     /// Жёстко включить рантайм-офлайн (принцип №2). Зовём на старте: по умолчанию флаг false, и без
     /// этого фоновая загрузка модели теоретически могла бы пойти в сеть. Сеть разрешаем ТОЛЬКО внутри download().
-    static func enforceRuntimeOffline() { DownloadUtils.enforceOffline = true }
+    static func enforceRuntimeOffline() { ModelHub.offlineMode = true }
 
     // MARK: - Загрузка / скачивание
 
@@ -53,7 +53,7 @@ final class StreamingEouEngine {
         if ready { return true }
         guard Self.modelInstalled else { kbLog("eou: модель не установлена"); return false }
         do {
-            DownloadUtils.enforceOffline = true                 // рантайм — ноль сети (принцип №2)
+            ModelHub.offlineMode = true                         // рантайм — ноль сети (принцип №2)
             // Конфигурацию берём библиотечную: она ставит cpuAndNeuralEngine и подсказки резидентности
             // ANE. Голый MLModelConfiguration() означает computeUnits = .all, то есть единственную
             // нашу модель, которой разрешено уехать на GPU и подраться там с чужой отрисовкой.
@@ -73,13 +73,13 @@ final class StreamingEouEngine {
     /// диалоге были втрое меньше правды.
     func download(progress: @escaping (Double) -> Void) async -> Bool {
         do {
-            DownloadUtils.enforceOffline = false                // на время скачивания сеть нужна
+            ModelHub.offlineMode = false                        // на время скачивания сеть нужна
             let mgr = StreamingEouAsrManager(configuration: MLModelConfigurationUtils.defaultConfiguration(),
                                              chunkSize: .ms160)
             try await mgr.loadModels(to: Self.modelRoot,
                                      configuration: MLModelConfigurationUtils.defaultConfiguration(),
                                      progressHandler: { p in progress(p.fractionCompleted) })
-            DownloadUtils.enforceOffline = true
+            ModelHub.offlineMode = true
             // ⚠️ СВЕРЯЕМ С ДИСКОМ, А НЕ ВЕРИМ СЕБЕ. Раньше здесь просто ставили ready = true, и
             // расхождение путей (см. modelDir) прошло мимо всех проверок: скачивание отчитывалось
             // об успехе, а следующий запуск не находил файлов и тихо откатывался на батч.
@@ -91,7 +91,7 @@ final class StreamingEouEngine {
             kbLog("eou: модель скачана и загружена")
             return true
         } catch {
-            DownloadUtils.enforceOffline = true
+            ModelHub.offlineMode = true
             kbLog("eou: скачивание не удалось: \(error)")
             return false
         }

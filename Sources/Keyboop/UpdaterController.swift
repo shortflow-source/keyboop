@@ -1,482 +1,320 @@
 import AppKit
-import Sparkle
+import Foundation
 
-/// Автообновления через Sparkle.
+/// A release advertised by Keyboop's public appcast. Download URLs and update payload metadata are
+/// deliberately not represented, so they cannot accidentally become part of this code path.
+struct ReleaseCandidate: Equatable {
+    let version: String
+    let channel: String?
+    let minimumSystemVersion: String?
+    let hardwareRequirements: String?
+
+    var isBeta: Bool { channel == "beta" }
+}
+
+private struct NumericVersion: Comparable, Equatable {
+    let parts: [Int]
+
+    init?(_ raw: String) {
+        guard raw.range(of: #"^[0-9]+(?:\.[0-9]+)*$"#, options: .regularExpression) != nil else { return nil }
+        let pieces = raw.split(separator: ".")
+        let values = pieces.compactMap { Int($0) }
+        guard !values.isEmpty, values.count == pieces.count else { return nil }
+        parts = values
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        for i in 0..<max(lhs.parts.count, rhs.parts.count) {
+            let l = i < lhs.parts.count ? lhs.parts[i] : 0
+            let r = i < rhs.parts.count ? rhs.parts[i] : 0
+            if l != r { return l < r }
+        }
+        return false
+    }
+}
+
+private final class AppcastParser: NSObject, XMLParserDelegate {
+    private(set) var releases: [ReleaseCandidate] = []
+    private var insideItem = false
+    private var field = ""
+    private var text = ""
+    private var version: String?
+    private var channel: String?
+    private var minimumSystemVersion: String?
+    private var hardwareRequirements: String?
+
+    func parse(_ data: Data) throws -> [ReleaseCandidate] {
+        let parser = XMLParser(data: data)
+        parser.delegate = self
+        guard parser.parse() else { throw parser.parserError ?? MonitorError.invalidFeed }
+        return releases
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        let name = (qName ?? elementName).split(separator: ":").last.map(String.init) ?? elementName
+        if name == "item" {
+            insideItem = true
+            version = nil; channel = nil; minimumSystemVersion = nil; hardwareRequirements = nil
+        }
+        guard insideItem else { return }
+        field = name
+        text = ""
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard insideItem else { return }
+        text += string
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?) {
+        let name = (qName ?? elementName).split(separator: ":").last.map(String.init) ?? elementName
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if insideItem, name == field {
+            switch name {
+            case "version", "shortVersionString":
+                if version == nil, NumericVersion(value) != nil { version = value }
+            case "channel": channel = value.isEmpty ? nil : value
+            case "minimumSystemVersion": minimumSystemVersion = value.isEmpty ? nil : value
+            case "hardwareRequirements": hardwareRequirements = value.isEmpty ? nil : value
+            default: break
+            }
+        }
+        if name == "item" {
+            if let version {
+                releases.append(ReleaseCandidate(version: version, channel: channel,
+                                                 minimumSystemVersion: minimumSystemVersion,
+                                                 hardwareRequirements: hardwareRequirements))
+            }
+            insideItem = false
+        }
+        field = ""; text = ""
+    }
+}
+
+private enum MonitorError: LocalizedError {
+    case invalidFeed
+    case invalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFeed: return L10n.t("upd.errorFeed")
+        case .invalidResponse: return L10n.t("upd.errorResponse")
+        }
+    }
+}
+
+/// Read-only upstream release monitor.
 ///
-/// Поведение (security review 15.06 + выбор автора): проверка и фоновое скачивание ВКЛ по умолчанию,
-/// но УСТАНОВКА по умолчанию — с согласия пользователя. Sparkle качает апдейт тихо и зовёт делегат
-/// `willInstallUpdateOnQuit`; мы его перехватываем (return true, держим install-блок) и вместо тихой
-/// подмены показываем СВОЁ уведомление «Обновить сейчас / Обновлять автоматически».
-///   • «Обновить сейчас» → ставим эту версию.
-///   • «Обновлять автоматически» → `silentAutoUpdate=true`; дальше ставим ТИХО в простое (когда юзер
-///     отошёл), не мешая. Так пользователь сам выбирает тихий режим — молча у всех мы не ставим.
-///
-/// Приватность: профайлинг выключен, `feedParametersForUpdater` НЕ реализован → ровно один GET за
-/// appcast + GET за DMG, без профиля/идентификатора. Подлинность — EdDSA + Developer ID.
-final class UpdaterController: NSObject, SPUUpdaterDelegate {
+/// Security boundary: this type can fetch text metadata and open a hard-coded GitHub comparison.
+/// It has no update-archive request, downloader, extractor, helper, relauncher, or replacement path.
+final class UpdaterController {
     static let shared = UpdaterController()
 
-    private var controller: SPUStandardUpdaterController?
-    private var pendingInstall: (() -> Void)?       // immediateInstallHandler от Sparkle, ждёт решения
-    private(set) var pendingVersion = ""
-    private let idleThreshold: TimeInterval = 300    // 5 минут простоя для тихой установки
-    private var lastDeferReason: String?             // чтобы не писать одну и ту же причину отказа в лог
+    private let feedURL = URL(string: "https://keyboop.com/appcast.xml")!
+    private let repository = "iffuno/keyboop"
+    private let interval: TimeInterval = 2 * 60 * 60
+    private let defaults = UserDefaults.standard
+    private let checksKey = "personal.upstreamChecks"
+    private let seenKey = "personal.seenUpstreamVersions"
+    private let lastSuccessKey = "personal.lastUpstreamCheck"
+    private var timer: Timer?
+    private var checking = false
 
-    /// Колбэк в AppDelegate: показать наше уведомление, что версия `$0` готова к установке.
-    var onUpdateReady: ((String) -> Void)?
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 30
+        config.httpAdditionalHeaders = ["User-Agent": "Keyboop-Personal/\(baselineVersion)"]
+        return URLSession(configuration: config)
+    }()
 
-    func start() {
-        guard controller == nil else { return }
-        controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
-        // ⚠️ В dev-режиме отладки апдейтера (KEYBOOP_UPDATER=1) скачивание ЗАПРЕЩЕНО: пусть Sparkle
-        // спрашивает фид и пишет в лог, но не приносит прод-DMG в dev-бандл (инцидент 23.07).
-        let debugDev = (Bundle.main.bundleIdentifier ?? "").hasSuffix(".dev")
-        controller?.updater.automaticallyDownloadsUpdates = automaticChecks && !debugDev
-        kbLog("updater: started (check=\(automaticChecks) silent=\(AppSettings.shared.silentAutoUpdate)"
-              + (debugDev ? ", DEV: скачивание запрещено" : "") + ")")
+    private init() {}
 
-        // ПРОВЕРКА ПРИ ЗАПУСКЕ (просьба автора 30.07). Сам Sparkle этого не делает: он помнит время
-        // прошлой проверки (SULastCheckTime переживает перезапуск) и досиживает ОСТАТОК интервала.
-        // В логе это видно дословно — «launched» и сразу «следующая проверка через 119 мин», то есть
-        // запуск проверку не вызвал. Для человека, который открыл Мак утром, разницы нет: интервал
-        // давно истёк и проверка случится сама. А вот «вышел и зашёл» её не даёт, и релиз, вышедший
-        // десять минут назад, ждёт лишние два часа без причины.
-        //
-        // Задержка в 25 секунд намеренная: старт и так занят прогревом модели распознавания и
-        // установкой тапа, лезть туда же с сетью незачем. Пользователь этой секунды не замечает.
-        guard automaticChecks else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self] in
-            guard let u = self?.controller?.updater, u.automaticallyChecksForUpdates else { return }
-            // Не дублируем Sparkle. Если интервал к моменту запуска уже истёк, он проверяет сам, и
-            // тогда наша проверка была бы вторым запросом за полминуты (наблюдалось при отладке
-            // 30.07: его проверка в 08:55:47, наша в 08:56:12). Спрашиваем у него самого, когда он
-            // ходил в последний раз, вместо того чтобы вести свой счёт.
-            if let last = u.lastUpdateCheckDate, Date().timeIntervalSince(last) < 300 {
-                kbLog("updater: проверку при запуске пропускаю — Sparkle только что проверял сам")
-                return
-            }
-            kbLog("updater: проверка при запуске")
-            u.checkForUpdatesInBackground()
-        }
+    private var baselineVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "KeyboopUpstreamBaselineVersion") as? String
+            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "0.0.0"
     }
 
-    /// Мастер-тумблер «Проверять обновления» (Sparkle хранит стейт в UserDefaults сам).
     var automaticChecks: Bool {
-        get { controller?.updater.automaticallyChecksForUpdates ?? true }
+        get { defaults.object(forKey: checksKey) == nil ? true : defaults.bool(forKey: checksKey) }
         set {
-            controller?.updater.automaticallyChecksForUpdates = newValue
-            controller?.updater.automaticallyDownloadsUpdates = newValue
+            defaults.set(newValue, forKey: checksKey)
+            schedule()
         }
     }
 
-    /// Проверить вручную («Проверить сейчас» / меню). Sparkle сам показывает окно «Проверяю…» → результат
-    /// («Установлена последняя версия» либо предложение обновиться). НО мы — LSUIElement-агент без иконки
-    /// в доке: без явной активации это окно НЕ выходит вперёд, и юзеру кажется, что «ничего не произошло»
-    /// (фидбэк 16.06). Поэтому активируем приложение прямо перед проверкой.
-    func checkNow() {
-        NSApp.activate(ignoringOtherApps: true)
-        // ⚠️ ЕСЛИ АПДЕЙТ УЖЕ У НАС НА РУКАХ, кнопка обязана показать ЕГО, а не уходить в Sparkle.
-        //
-        // Воспроизведено на реальной машине 09.08 (0.3.16): 0.3.17 скачана в 10:23, тихая установка
-        // отложена в 11:00 («открыто окно»), и с тех пор нажатие «Проверить сейчас» не делает
-        // РОВНО НИЧЕГО: ни окна, ни строки в логе. Причина та же, что у задачи 110: вернув `true`
-        // из `willInstallUpdateOnQuit`, мы забрали цикл себе, и `checkForUpdates` внутри Sparkle
-        // становится пустышкой. Человек при этом видит мёртвую кнопку и идёт качать с сайта.
-        //
-        // Кнопка, которая молчит, хуже кнопки, которой нет.
-        if pendingInstall != nil {
-            kbLog("updater: проверка вручную при готовом \(pendingVersion) — показываю плашку вместо пустого запроса")
-            silentFallback?.cancel(); silentFallback = nil
-            IdleMonitor.shared.stop()
-            armPendingSafety()
-            onUpdateReady?(pendingVersion)
-            return
-        }
-        controller?.checkForUpdates(nil)
-    }
-
-    /// Как долго держим у себя право установить, если человек не нажал ни одной кнопки в плашке.
-    /// По истечении — отпускаем и перезаводим цикл Sparkle, иначе плановые проверки не возобновятся
-    /// (см. большой комментарий в делегате). Десять минут: плашка живёт на экране куда меньше.
-    private let pendingTTL: TimeInterval = 600
-    private var pendingSafety: DispatchWorkItem?
-
-    /// Сколько ждём удобного момента в ТИХОМ режиме, прежде чем перестать молчать.
-    ///
-    /// ⚠️ Час, а не десять минут: тихая установка ждёт пяти минут без ввода, и у человека, который
-    /// весь день за компьютером, такой паузы может не случиться до вечера. Ронять её раньше значит
-    /// показывать плашку тем, кто явно попросил его не трогать.
-    private let silentFallbackTTL: TimeInterval = 3600
-    private var silentFallback: DispatchWorkItem?
-
-    /// ⚠️ ГЛАВНАЯ ПОЧИНКА 09.08.2026: в тихом режиме апдейт мог зависнуть НАВСЕГДА.
-    ///
-    /// Возврат `true` из `willInstallUpdateOnQuit` означает «установку беру на себя», и Sparkle в
-    /// ответ паркует не только этот цикл, но и ВСЕ будущие проверки. В обычном режиме от этого
-    /// защищает `armPendingSafety()`, и рядом с ним прямо написано «без неё не возвращать true».
-    /// А тихая ветка возвращала `true` БЕЗ всякой страховки. Дальше достаточно, чтобы пяти минут
-    /// простоя не случилось (человек работает, окно открыто, идёт диктовка), и апдейт оставался
-    /// скачанным, но не поставленным, а проверки не возобновлялись уже никогда. Ровно это люди и
-    /// описывают словами «само не обновляется, скачал с сайта руками».
-    ///
-    /// Симптом воспроизведён на реальной машине 09.08: 0.3.17 скачана в 10:23, и после строки
-    /// «готов к установке (silent=true)» в логе НЕТ НИ ОДНОЙ строки про обновления. Не потому что
-    /// всё хорошо, а потому что состояние стало невидимым.
-    ///
-    /// Что делаем по истечении часа: перестаём молчать и показываем обычную плашку. Это честнее
-    /// тишины, и человек получает кнопку. Заодно взводим `armPendingSafety()`, то есть дальше
-    /// работает обычный десятиминутный предохранитель.
-    private func armSilentFallback() {
-        silentFallback?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.pendingInstall != nil else { return }
-            kbLog("updater: тихо поставить \(self.pendingVersion) не вышло за \(Int(self.silentFallbackTTL / 60)) мин — показываю плашку")
-            IdleMonitor.shared.stop()
-            self.armPendingSafety()
-            self.onUpdateReady?(self.pendingVersion)
-        }
-        silentFallback = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + silentFallbackTTL, execute: work)
-    }
-
-    /// Страховка от «плашку закрыли, а установку никто не позвал». Без неё возврат `true` из делегата
-    /// убивает ВСЕ будущие проверки обновлений — тот самый механизм, из-за которого люди сидят на
-    /// 0.2.69 до сих пор.
-    private func armPendingSafety() {
-        pendingSafety?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.pendingInstall != nil else { return }
-            self.pendingInstall = nil
-            kbLog("updater: плашку \(self.pendingVersion) не тронули за \(Int(self.pendingTTL / 60)) мин — "
-                  + "отпускаю установку и перезавожу расписание")
-            self.controller?.updater.resetUpdateCycle()
-        }
-        pendingSafety = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + pendingTTL, execute: work)
-    }
-
-    /// ОТКАЗ: человек закрыл плашку крестиком (отзыв #125, 11.08.2026).
-    ///
-    /// Раньше крестик значил «спрятать»: обработчик установки оставался у нас, через `pendingTTL`
-    /// страховка его отпускала, и обновление приезжало при следующем выходе. С точки зрения человека
-    /// это «я отказался, а оно всё равно поставилось» — и он прав. Для программы, которая читает
-    /// клавиатуру, доверие дороже свежести версии.
-    ///
-    /// Что делаем: обработчик НЕ отпускаем (пока он у нас, Sparkle не поставит апдейт при выходе), а
-    /// страховку от вечной парковки перезаводим на сутки вместо десяти минут. То есть отказ работает
-    /// как отказ, но расписание не умирает: через сутки цикл оживёт и предложит снова.
-    ///
-    /// ⚠️ Именно перезавести, а не отменить. Ветка «держим обработчик без страховки» уже стоила нам
-    /// людей, застрявших на 0.2.69 навсегда, и об этом написано этажом выше.
-    func declinePending() {
-        guard pendingInstall != nil else { return }
-        kbLog("updater: \(pendingVersion) отклонён крестиком — при выходе НЕ ставим, вернусь через сутки")
-        pendingSafety?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.pendingInstall != nil else { return }
-            self.pendingInstall = nil
-            kbLog("updater: сутки после отказа прошли — перезавожу расписание обновлений")
-            self.controller?.updater.resetUpdateCycle()
-        }
-        pendingSafety = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 24 * 3600, execute: work)
-    }
-
-    /// Поставить отложенный апдейт сейчас (левая кнопка плашки, «Обновить»).
-    ///
-    /// Обработчик установки у нас на руках в ЛЮБОМ режиме (см. делегат), поэтому ставим и
-    /// перезапускаемся сразу, без второго окна и без повторного вопроса. Ветка с `checkNow()` ниже
-    /// остаётся только на случай, когда обработчика нет: например плашка провисела дольше pendingTTL
-    /// и мы уже отпустили установку, а человек нажал кнопку на старой плашке.
-    func installPendingNow() {
-        pendingSafety?.cancel(); pendingSafety = nil
-        silentFallback?.cancel(); silentFallback = nil
-        IdleMonitor.shared.stop()
-        guard let block = pendingInstall else {
-            kbLog("updater: показываю штатное окно установки \(pendingVersion)")
-            checkNow()
-            return
-        }
-        pendingInstall = nil
-        kbLog("updater: ставлю \(pendingVersion) по запросу пользователя")
-        block()
-    }
-
-    /// Включить тихий режим и поставить текущий (кнопка «Обновлять автоматически»).
-    func enableSilentAndInstall() {
-        AppSettings.shared.silentAutoUpdate = true
-        kbLog("updater: пользователь выбрал тихие автообновления")
-        installPendingNow()
-    }
-
-    /// Тумблер «бета-версии» переключили — перезаводим цикл, иначе смена канала доедет только к
-    /// следующей плановой проверке (а у агента в строке меню она может быть через сутки).
-    func noteChannelChanged() {
-        kbLog("updater: канал = \(AppSettings.shared.betaChannel ? "beta" : "стабильный")")
-        controller?.updater.resetUpdateCycle()
-    }
-
-    // MARK: SPUUpdaterDelegate
-
-    /// В какие каналы нам разрешено смотреть.
-    ///
-    /// Механика Sparkle (`SPUUpdaterDelegate.h:90-113`): элемент appcast без `<sparkle:channel>`
-    /// лежит в канале по умолчанию и виден ВСЕМ, а помеченный `beta` — только тем, у кого «beta»
-    /// есть в этом наборе. Канал по умолчанию входит в разрешённые ВСЕГДА, поэтому бета-участник
-    /// продолжает получать и обычные релизы: он видит строго больше, а не другое.
-    ///
-    /// Зачем это вообще: приложение стоит перехватчиком клавиатуры у всех сразу, и 0.2.70 появился
-    /// ровно потому, что глотание клавиш убивало пробел во всей системе. Обкатка на добровольцах
-    /// ловит такой класс на десятках людей вместо тысяч.
-    /// ⚠️ Селектор пришпилен явно. Методы `SPUUpdaterDelegate` необязательные, и Sparkle зовёт их
-    /// через ObjC-протокол: если бы Swift переименовал метод хоть на букву иначе, компилятор бы
-    /// промолчал, а канал просто никогда не спрашивался. То есть тумблер «бета» стоял бы в
-    /// настройках и не делал ничего — молчаливый отказ, а их мы в этом проекте ловим весь день.
-    @objc(allowedChannelsForUpdater:)
-    func allowedChannels(for updater: SPUUpdater) -> Set<String> {
-        AppSettings.shared.betaChannel ? ["beta"] : []
-    }
-
-    // MARK: Видимость проверки в логе
-    //
-    // ⚠️ До 29.07 в логе было ровно две строки на всю жизнь апдейтера: «started» при запуске и
-    // «скачан» уже перед установкой. Между ними — ничего. Поэтому жалоба «у меня не обновляется»
-    // была принципиально неразбираемой: мы не знали даже, ходило ли приложение за фидом. Разбор
-    // 29.07 пришлось вести по системному логу macOS (CFNetwork + os_log Sparkle), которого у
-    // пользователя в отчёте нет и быть не может. Ниже — весь путь проверки, по строке на событие,
-    // словами. Ни версии текста, ни адресов, ни идентификаторов — только наши же номера версий.
-
-    @objc(updater:didFinishLoadingAppcast:)
-    func updater(_ updater: SPUUpdater, didFinishLoading appcast: SUAppcast) {
-        let top = appcast.items.first?.displayVersionString ?? "?"
-        kbLog("updater: фид получен, записей \(appcast.items.count), верхняя \(top)")
-    }
-
-    @objc(updater:didFindValidUpdate:)
-    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
-        kbLog("updater: найден апдейт \(item.displayVersionString)\(item.isCriticalUpdate ? " (критический)" : "")")
-    }
-
-    @objc(updaterDidNotFindUpdate:error:)
-    func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
-        let e = error as NSError
-        // Sparkle кладёт сюда ПРИЧИНУ отказа. Без неё «апдейта нет» неотличимо от «мы его отбраковали».
-        let why: String
-        switch e.userInfo[SPUNoUpdateFoundReasonKey] as? Int {
-        case Int(SPUNoUpdateFoundReason.onLatestVersion.rawValue):          why = "у нас уже свежая"
-        case Int(SPUNoUpdateFoundReason.onNewerThanLatestVersion.rawValue): why = "у нас новее, чем в фиде"
-        case Int(SPUNoUpdateFoundReason.systemIsTooOld.rawValue):           why = "версия требует более новой macOS"
-        case Int(SPUNoUpdateFoundReason.systemIsTooNew.rawValue):           why = "версия помечена как несовместимая с этой macOS"
-        case Int(SPUNoUpdateFoundReason.hardwareDoesNotSupportARM64.rawValue): why = "версия только для Apple Silicon"
-        default:                                                             why = "причина не указана"
-        }
-        let latestItem = e.userInfo[SPULatestAppcastItemFoundKey] as? SUAppcastItem
-        let latest = latestItem?.displayVersionString
-        kbLog("updater: апдейта нет — \(why)\(latest.map { ", свежайшая в фиде \($0)" } ?? "")")
-        offerBetaIfNewerExists(latestItem)
-    }
-
-    /// «У ВАС ПОСЛЕДНЯЯ ВЕРСИЯ», КОГДА НОВЕЕ ЕСТЬ, НО ОНА БЕТА (задача 107).
-    ///
-    /// Это не баг, но выглядит багом, и в отзыве это видно построчно: человек честно нажимает
-    /// «Проверить обновления», Sparkle честно отвечает «установлена последняя версия», а на сайте в
-    /// это же время лежит версия новее. Он делает единственный доступный вывод: обновления сломаны.
-    /// Правда же в том, что новее только бета, а бета-канал у него выключен, и об этом ему никто не
-    /// сказал ни словом.
-    ///
-    /// Поэтому после ответа «нечего ставить» мы смотрим, что за версия лежит в фиде самой свежей.
-    /// Если она НОВЕЕ нашей, значит существует сборка, которую мы сознательно не берём, и человеку
-    /// про неё говорим сами, вместе с кнопкой включить бета-канал.
-    ///
-    /// ⚠️ ЧЕСТНО ПРО ГРАНИЦУ ЗНАНИЯ. Отдаёт ли Sparkle в `SPULatestAppcastItemFoundKey` сборку из
-    /// ЧУЖОГО канала или уже отфильтрованную, из документации не следует, а проверить это можно
-    /// только на живой бете новее нашей: сейчас такой в фиде нет. Код написан так, что оба ответа
-    /// безопасны. Пришла версия новее — говорим о ней. Пришла отфильтрованная (не новее) — молчим,
-    /// как молчали раньше, и ни одного ложного сообщения не появляется. Проверить на следующем же
-    /// бета-релизе: `Tools/updateprobe` умеет притвориться клиентом любой версии.
-    private func offerBetaIfNewerExists(_ latest: SUAppcastItem?) {
-        guard !AppSettings.shared.betaChannel else { return }   // человек и так на бете, говорить не о чем
-        guard let latest, let ver = latest.displayVersionString as String? else { return }
-        let mine = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
-        guard ver.compare(mine, options: .numeric) == .orderedDescending else { return }
-        kbLog("updater: в фиде есть \(ver), новее нашей \(mine), но бета-канал выключен — предлагаю включить")
-        DispatchQueue.main.async {
-            AppBanner.shared.show(
-                title: L10n.t("upd.betaExistsTitle"),
-                body: String(format: L10n.t("upd.betaExistsBody"), ver),
-                actions: [.init(title: L10n.t("upd.betaExistsYes"), coral: true) {
-                    AppSettings.shared.betaChannel = true
-                    NotificationCenter.default.post(name: .updaterStatusChanged, object: nil)
-                    UpdaterController.shared.checkNow()
-                }])
-        }
-    }
-
-    @objc(updater:willDownloadUpdate:withRequest:)
-    func updater(_ updater: SPUUpdater, willDownloadUpdate item: SUAppcastItem, with request: NSMutableURLRequest) {
-        kbLog("updater: качаю \(item.displayVersionString)")
-    }
-
-    @objc(updater:failedToDownloadUpdate:error:)
-    func updater(_ updater: SPUUpdater, failedToDownloadUpdate item: SUAppcastItem, error: Error) {
-        kbLog("updater: не скачалось \(item.displayVersionString) — \(error.localizedDescription)")
-    }
-
-    @objc(updater:willScheduleUpdateCheckAfterDelay:)
-    func updater(_ updater: SPUUpdater, willScheduleUpdateCheckAfterDelay delay: TimeInterval) {
-        kbLog("updater: следующая проверка через \(Int(delay / 60)) мин")
-    }
-
-    /// Любой обрыв цикла проверки. `noUpdateError` — это не обрыв, а нормальный ответ «нечего ставить»,
-    /// его уже написал `updaterDidNotFindUpdate`, второй раз не дублируем.
-    /// Последний сбой проверки обновлений: текст для человека и когда случился. `nil` — всё в порядке.
-    ///
-    /// ⚠️ ЗАВЕДЕНО, ПОТОМУ ЧТО СБОЙ БЫЛ МОЛЧАЛИВЫМ (03.08.2026). Раньше эта функция только писала в
-    /// лог, и человек не узнавал ничего: жмёт «Проверить обновления», а в ответ тишина. Ровно так
-    /// выглядела жалоба («скачал с сайта, пару дней обновлялось, потом перестало, нажимаю проверить
-    /// и ничего не происходит») и ровно это видно в отчёте с Intel-мака, где в логе висело
-    /// «код 1005» — Sparkle отказывался обновлять приложение, запущенное не из «Программ».
-    ///
-    /// Причин, по которым проверка срывается, много и все они снаружи: нет сети, VPN режет домен,
-    /// корпоративный фильтр, антивирус, запуск не из «Программ». Мы ни одну из них не исправим,
-    /// но человек ОБЯЗАН узнать, что обновления не работают, иначе он месяцами сидит на старой
-    /// версии и жалуется на давно починенное. Половина нашей почты именно такая.
     static private(set) var lastFailure: (text: String, at: Date)?
-
-    /// Когда в последний раз проверка ЗАВЕРШИЛАСЬ УСПЕШНО (неважно, нашла обновление или нет).
-    /// По ней считаем «давно не проверялось»: одиночный сбой это шум, две недели тишины это поломка.
-    static var lastSuccessfulCheck: Date? {
-        UpdaterController.shared.controller?.updater.lastUpdateCheckDate
-    }
-
-    /// Сколько дней тишины считаем поводом сказать вслух. Неделя: при интервале в два часа это
-    /// восемьдесят с лишним неудачных попыток подряд, случайностью такое уже не объяснить.
+    static var lastSuccessfulCheck: Date? { UserDefaults.standard.object(forKey: "personal.lastUpstreamCheck") as? Date }
     static let staleAfterDays = 7
-
-    /// Проверки не проходят достаточно долго, чтобы об этом сказать.
     static var updatesLookBroken: Bool {
-        // Сам выключил проверки — не наше дело напоминать.
         guard UpdaterController.shared.automaticChecks else { return false }
         guard let last = lastSuccessfulCheck else { return lastFailure != nil }
-        return Date().timeIntervalSince(last) > Double(staleAfterDays) * 86400
+        return Date().timeIntervalSince(last) > Double(staleAfterDays) * 86_400
     }
 
-    @objc(updater:didAbortWithError:)
-    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
-        let e = error as NSError
-        guard e.code != Int(SUError.noUpdateError.rawValue) else { return }
-        kbLog("updater: проверка сорвалась — \(e.localizedDescription) (код \(e.code))")
-        Self.lastFailure = (e.localizedDescription, Date())
-        DispatchQueue.main.async { NotificationCenter.default.post(name: .updaterStatusChanged, object: nil) }
+    func start() {
+        schedule()
+        guard automaticChecks else { return }
+        let last = Self.lastSuccessfulCheck ?? .distantPast
+        let delay: TimeInterval = Date().timeIntervalSince(last) >= interval ? 25 : interval
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard self?.automaticChecks == true else { return }
+            self?.check(manual: false)
+        }
+        kbLog("upstream monitor: started (check=\(automaticChecks), beta=\(AppSettings.shared.betaChannel), baseline=\(baselineVersion))")
     }
 
-    /// Sparkle скачал апдейт и готов ставить. Перехватываем: либо тихо в простое (если юзер выбрал
-    /// «авто»), либо спрашиваем нашим уведомлением.
-    ///
-    /// ⚠️ ВОЗВРАЩАЕМОЕ ЗНАЧЕНИЕ ЗДЕСЬ РЕШАЕТ СУДЬБУ ВСЕХ БУДУЩИХ ПРОВЕРОК (найдено ревью 28.07,
-    /// подтверждено хедером `SPUUpdaterDelegate.h:424-431`). Раньше мы возвращали `true` ВСЕГДА,
-    /// а по документации это значит «я беру установку на себя», и Sparkle в ответ
-    /// «stalls the current update cycle and prevents future update cycles from running».
-    /// То есть у человека с настройками ПО УМОЛЧАНИЮ (тихая установка выключена) всё выглядело так:
-    /// скачался один апдейт, показалась плашка, он её закрыл — и плановые проверки прекратились
-    /// НАВСЕГДА. Приложение живёт в строке меню неделями, так что молча застревало на той версии.
-    /// Комментарий «переспросит на следующей проверке» в AppDelegate обещал ровно то, чего уже не
-    /// могло случиться.
-    ///
-    /// Теперь по документации: `true` только когда мы действительно держим установку у себя
-    /// (тихий режим). В обычном режиме `false` — плашку показываем свою, но расписание остаётся за
-    /// Sparkle: он и переспросит сам, и критические апдейты покажет сразу.
-    /// `immediateInstallHandler` при `false` использовать НЕЛЬЗЯ (хедер, строка 437), поэтому в этой
-    /// ветке мы его даже не сохраняем — кнопка «Обновить сейчас» идёт через обычную проверку.
-    /// ⚠️ Селектор пришпилен, как и у `allowedChannels`, и по той же причине: метод необязательный,
-    /// зовётся через ObjC. Разъедься имя на букву — компилятор смолчит, Sparkle поставит апдейт
-    /// молча при выходе, а наше уведомление «Обновить сейчас» не покажется никогда. Симптом при этом
-    /// ровно тот, с которым к нам приходят: «оно не обновляется само».
-    @objc(updater:willInstallUpdateOnQuit:immediateInstallationBlock:)
-    func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem,
-                 immediateInstallationBlock immediateInstallHandler: @escaping () -> Void) -> Bool {
-        pendingVersion = item.displayVersionString
-        let silent = AppSettings.shared.silentAutoUpdate
-        kbLog("updater: \(pendingVersion) скачан, готов к установке (silent=\(silent))")
-        guard silent else {
-            // ⚠️ ТЕПЕРЬ ДЕРЖИМ УСТАНОВКУ У СЕБЯ И В ОБЫЧНОМ РЕЖИМЕ (30.07, просьба автора).
-            // Раньше здесь было `pendingInstall = nil; return false`, и кнопка «Обновить» в нашей
-            // плашке не могла поставить апдейт сама — она отдавала человека штатному окну Sparkle,
-            // где надо было нажать «обновить» ВТОРОЙ раз. автор прошёл этот путь вживую и попросил
-            // убрать лишний шаг: одна кнопка, одно нажатие, приложение перезапускается.
-            //
-            // Но `true` здесь означает «я беру установку на себя», и Sparkle в ответ паркует не
-            // только текущий цикл, но и ВСЕ БУДУЩИЕ проверки. Именно так люди застревали на 0.2.69
-            // навсегда: плашку закрыли, обработчик никто не позвал, расписание умерло. Поэтому
-            // держать обработчик можно ТОЛЬКО вместе со страховкой, которая ниже: не позвали за
-            // pendingTTL — отпускаем установку и перезаводим цикл. Без неё не возвращать true.
-            pendingInstall = immediateInstallHandler
-            armPendingSafety()
-            DispatchQueue.main.async { [weak self] in self?.onUpdateReady?(self?.pendingVersion ?? "") }
+    func checkNow() {
+        NSApp.activate(ignoringOtherApps: true)
+        check(manual: true)
+    }
+
+    func noteChannelChanged() {
+        kbLog("upstream monitor: beta = \(AppSettings.shared.betaChannel)")
+        if AppSettings.shared.betaChannel { check(manual: false) }
+    }
+
+    private func schedule() {
+        timer?.invalidate(); timer = nil
+        guard automaticChecks else { return }
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.check(manual: false) }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func check(manual: Bool) {
+        guard !checking else {
+            if manual {
+                Task { @MainActor in
+                    self.showInfo(title: L10n.t("upd.checking"), body: "")
+                }
+            }
+            return
+        }
+        checking = true
+        kbLog("upstream monitor: \(manual ? "manual" : "scheduled") check")
+        Task { [weak self] in
+            guard let self else { return }
+            defer { Task { @MainActor in self.checking = false } }
+            do {
+                let candidates = try await fetchCandidates()
+                let result = try await newestReviewable(in: candidates, manual: manual)
+                await MainActor.run {
+                    self.noteSuccess()
+                    self.present(result: result, manual: manual)
+                }
+            } catch {
+                await MainActor.run { self.noteFailure(error, manual: manual) }
+            }
+        }
+    }
+
+    private func fetchCandidates() async throws -> [ReleaseCandidate] {
+        var request = URLRequest(url: feedURL)
+        request.httpMethod = "GET"
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { throw MonitorError.invalidResponse }
+        let parsed = try AppcastParser().parse(data)
+        guard !parsed.isEmpty, let baseline = NumericVersion(baselineVersion) else { throw MonitorError.invalidFeed }
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let system = NumericVersion("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)")!
+        return parsed.filter { item in
+            guard let version = NumericVersion(item.version), version > baseline else { return false }
+            if item.isBeta && !AppSettings.shared.betaChannel { return false }
+            if let minimum = item.minimumSystemVersion, let minVersion = NumericVersion(minimum), system < minVersion { return false }
+            if let hardware = item.hardwareRequirements, !hardware.isEmpty, hardware != "arm64" { return false }
             return true
-        }
-        // Юзер выбрал «авто» → ставим тихо, когда отошёл (5 мин без ввода, не идёт диктовка/окно).
-        pendingInstall = immediateInstallHandler
-        kbLog("updater: жду 5 минут простоя, чтобы поставить \(pendingVersion) тихо")
-        armSilentFallback()   // ⚠️ БЕЗ ЭТОГО апдейт и все будущие проверки паркуются навсегда
-        IdleMonitor.shared.waitForIdle(threshold: idleThreshold) { [weak self] in self?.installWhenClear() }
-        return true
+        }.sorted { NumericVersion($0.version)! > NumericVersion($1.version)! }
     }
 
-    /// Тихая установка только когда реально никто не мешает.
-    ///
-    /// ⚠️ Отказ ПЕРЕВЗВОДИТ ожидание простоя (28.07). Раньше отказ был тупиком: ждали простоя один
-    /// раз, при занятости молча выходили — и апдейт висел до перезапуска приложения. Плюс ни строки
-    /// в лог, из-за чего этот путь и был невидим при разборе.
-    private func installWhenClear() {
-        guard pendingInstall != nil else { return }
-        // ⚠️ Тумблер могли ВЫКЛЮЧИТЬ уже после того, как мы взвели ожидание (найдено ревью 28.07:
-        // человек включил тихий режим, дочитал подпись, передумал — а мы через 5 минут молча
-        // подменяли бинарь и перезапускались вопреки явному «нет»). Правило проекта: установка
-        // только с согласия пользователя.
-        guard AppSettings.shared.silentAutoUpdate else {
-            IdleMonitor.shared.stop()
-            return
+    private enum ReviewResult { case release(ReleaseCandidate), sourcePending(ReleaseCandidate?), none }
+
+    private func newestReviewable(in candidates: [ReleaseCandidate], manual: Bool) async throws -> ReviewResult {
+        guard let newest = candidates.first else { return .none }
+        if !manual, seenVersions.contains(newest.version) { return .none }
+        for candidate in candidates {
+            if try await publicTagExists(candidate.version) { return .release(candidate) }
         }
-        // Причины отказа. Модель качается без возобновления (до 1.6 ГБ), а перезапуск её убьёт;
-        // запись хоткея держит движок отключённым, перезапуск посреди неё — гарантированная путаница.
-        let reason: String?
-        if VoiceController.shared.isRecording { reason = "идёт диктовка" }
-        else if ModelDownloader.shared.downloadingName != nil { reason = "качается модель" }
-        else if HotkeyRecording.active { reason = "идёт запись комбинации" }
-        else if NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey }) { reason = "открыто окно" }
-        else { reason = nil }
-        guard let reason else { installPendingNow(); return }
-        // ⚠️ Логируем только СМЕНУ причины. Ожидание перевзводится каждые ~20с, и строка на каждый
-        // отказ забивала бы лог целиком: за сутки это сотни килобайт, а в багрепорт уходит хвост
-        // из 300 строк — то есть шум вытеснил бы всё полезное (найдено ревью 28.07).
-        if reason != lastDeferReason {
-            lastDeferReason = reason
-            kbLog("updater: тихая установка отложена (\(reason)) — жду простоя снова")
-        }
-        IdleMonitor.shared.waitForIdle(threshold: idleThreshold) { [weak self] in self?.installWhenClear() }
+        return .sourcePending(newest)
     }
 
-    /// Тумблер тихих обновлений выключили — гасим ожидание простоя.
-    func cancelSilentWait() {
-        IdleMonitor.shared.stop()
-        silentFallback?.cancel(); silentFallback = nil
-        lastDeferReason = nil
+    private func publicTagExists(_ version: String) async throws -> Bool {
+        guard NumericVersion(version) != nil,
+              let url = URL(string: "https://api.github.com/repos/\(repository)/git/ref/tags/v\(version)") else { return false }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let (_, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw MonitorError.invalidResponse }
+        if http.statusCode == 200 { return true }
+        if http.statusCode == 404 { return false }
+        throw MonitorError.invalidResponse
     }
 
-    /// Тумблер «обновлять тихо» включили, когда апдейт УЖЕ скачан и ждёт.
-    /// Без этого он продолжал бы ждать нашего уведомления, которого в тихом режиме не будет.
-    ///
-    /// Если handler'а на руках нет, значит на этот апдейт мы уже ответили Sparkle «ставь сам»
-    /// (обычный режим). Взять его обратно нельзя, поэтому просто перезаводим цикл: Sparkle
-    /// переспросит, и следующий апдейт придёт уже в тихом режиме.
-    func noteSilentModeEnabled() {
-        guard pendingInstall != nil else {
-            controller?.updater.resetUpdateCycle()
-            return
+    @MainActor private func present(result: ReviewResult, manual: Bool) {
+        switch result {
+        case .release(let release): showRelease(release)
+        case .sourcePending(let release):
+            guard manual else {
+                if let release { kbLog("upstream monitor: \(release.version) announced, public source tag missing") }
+                return
+            }
+            showInfo(title: String(format: L10n.t("upd.sourcePendingTitle"), release?.version ?? "?"),
+                     body: L10n.t("upd.sourcePendingBody"))
+        case .none:
+            if manual { showInfo(title: L10n.t("upd.currentTitle"), body: L10n.t("upd.currentBody")) }
         }
-        kbLog("updater: включили тихий режим при готовом апдейте — жду простоя")
-        armSilentFallback()
-        IdleMonitor.shared.waitForIdle(threshold: idleThreshold) { [weak self] in self?.installWhenClear() }
+    }
+
+    @MainActor private func showRelease(_ release: ReleaseCandidate) {
+        let kind = release.isBeta ? L10n.t("upd.kindBeta") : L10n.t("upd.kindStable")
+        // Scheduled checks show each exact version once. Manual checks deliberately bypass this
+        // marker, so the user can reopen the comparison whenever they choose.
+        markSeen(release.version)
+        AppBanner.shared.show(
+            title: String(format: L10n.t("upd.notifyTitle"), release.version),
+            body: String(format: L10n.t("upd.notifyBody"), kind),
+            actions: [.init(title: L10n.t("upd.review"), coral: true) { [weak self] in
+                self?.openComparison(to: release.version)
+            }]
+        )
+    }
+
+    @MainActor private func showInfo(title: String, body: String) {
+        AppBanner.shared.show(title: title, body: body, autoDismiss: 7)
+    }
+
+    @MainActor private func openComparison(to version: String) {
+        guard NumericVersion(baselineVersion) != nil, NumericVersion(version) != nil,
+              let url = URL(string: "https://github.com/\(repository)/compare/v\(baselineVersion)...v\(version)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private var seenVersions: Set<String> { Set(defaults.stringArray(forKey: seenKey) ?? []) }
+
+    private func markSeen(_ version: String) {
+        guard NumericVersion(version) != nil else { return }
+        var seen = seenVersions
+        seen.insert(version)
+        defaults.set(Array(seen).sorted(), forKey: seenKey)
+        kbLog("upstream monitor: v\(version) marked reviewed/notified")
+    }
+
+    @MainActor private func noteSuccess() {
+        defaults.set(Date(), forKey: lastSuccessKey)
+        Self.lastFailure = nil
+        NotificationCenter.default.post(name: .updaterStatusChanged, object: nil)
+    }
+
+    @MainActor private func noteFailure(_ error: Error, manual: Bool) {
+        let text = error.localizedDescription
+        kbLog("upstream monitor: check failed — \(text)")
+        Self.lastFailure = (text, Date())
+        NotificationCenter.default.post(name: .updaterStatusChanged, object: nil)
+        if manual { showInfo(title: L10n.t("upd.problem"), body: text) }
     }
 }

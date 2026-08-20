@@ -1,0 +1,15 @@
+# Personal build dependency pins
+
+whisper.cpp
+  tag: v1.9.1
+  commit: f049fff95a089aa9969deb009cdd4892b3e74916
+  source: https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.1.tar.gz
+  sha256: 147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447
+
+FluidAudio
+  tag: v0.15.6
+  commit: 4dbf4f9f9a5ff3a53ade848d7ba4e3df13db859b
+  source: https://github.com/FluidInference/FluidAudio/archive/refs/tags/v0.15.6.tar.gz
+  sha256: e3e513d3f677d6f5eee1dc8e4de0009de1e0ba78ca425e80ad198e9671081418
+
+The application contains no Sparkle framework. macOS system frameworks are supplied by the OS.

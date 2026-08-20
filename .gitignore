@@ -5,6 +5,9 @@
 # Сборка и дистрибутивы (пересобираются)
 .build/
 Keyboop.app/
+Keyboop Personal.app/
+.personal-signing.keychain-db*
+.personal-signing-keychain-password
 *.dmg
 *.delta
 sparkle-updates/            # 860 МБ старых сборок, и они же лежат на сервере

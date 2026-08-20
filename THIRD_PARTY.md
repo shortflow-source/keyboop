@@ -7,22 +7,7 @@ Keyboop сам распространяется под MIT. Ниже — всё 
 
 ---
 
-## 1. Sparkle — автообновление
-
-Фреймворк <https://sparkle-project.org>, лицензия MIT. Лежит в бандле:
-`Keyboop.app/Contents/Frameworks/Sparkle.framework`, исходники — `vendor/sparkle`.
-
-```
-Copyright (c) 2006-2013 Andy Matuschak
-Copyright (c) 2009-2013 Elgato Systems GmbH
-Copyright (c) 2011-2014 Kornel Lesiński
-… (полный текст: vendor/sparkle/LICENSE)
-```
-
-Sparkle включает компоненты сторонних авторов со своими лицензиями — их тексты
-идут вместе с фреймворком.
-
-## 2. whisper.cpp — распознавание речи (движок Whisper)
+## 1. whisper.cpp — распознавание речи (движок Whisper)
 
 <https://github.com/ggml-org/whisper.cpp>, лицензия MIT, исходники — `vendor/whisper.cpp`.
 Собирается в приложение статически.
@@ -37,7 +22,7 @@ Copyright (c) 2023-2026 The ggml authors
 настройках. Веса Whisper — OpenAI, MIT, репозиторий
 <https://huggingface.co/ggerganov/whisper.cpp>.
 
-## 3. FluidAudio — распознавание речи (движок Parakeet)
+## 2. FluidAudio — распознавание речи (движок Parakeet)
 
 <https://github.com/FluidInference/FluidAudio>, лицензия Apache-2.0, исходники —
 `vendor/FluidAudio`, собранные артефакты — `vendor/fluidaudio-prebuilt`. Собственные
@@ -48,7 +33,7 @@ Apache License, Version 2.0
 … (полный текст: vendor/FluidAudio/LICENSE)
 ```
 
-## 4. Модель Parakeet (NVIDIA) — скачивается по действию человека
+## 3. Модель Parakeet (NVIDIA) — скачивается по действию человека
 
 Модель распознавания речи **NVIDIA Parakeet TDT** в CoreML-порте FluidInference.
 В приложение не входит: скачивается из настроек по кнопке, с нашего зеркала
@@ -63,7 +48,7 @@ Apache License, Version 2.0
 > и её CoreML-порт), лицензия у неё другая — **OpenMDW-1.1** (Linux Foundation), и
 > сюда нужно положить её текст отдельным разделом плюс сохранить copyright/origin-нотисы.
 
-## 5. Языковые данные (триграммы и словари RU/EN)
+## 4. Языковые данные (триграммы и словари RU/EN)
 
 Файлы `Sources/Keyboop/Resources/trigrams_ru.json`, `trigrams_en.json`,
 `words_ru.json`, `words_en.json` взяты из проекта **keyswitcher**
@@ -91,7 +76,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND...
 > корпуса (wordfreq / FrequencyWords), чтобы не зависеть от внешних данных. Тогда
 > этот раздел можно убрать. Пока используем keyswitcher-данные (MIT это разрешает).
 
-## 6. Системные фреймворки Apple
+## 5. Системные фреймворки Apple
 
 AppKit, Carbon (Text Input Services), CoreGraphics, IOKit, AVFoundation, Speech,
 Translation и прочие — часть macOS, отдельной атрибуции не требуют.

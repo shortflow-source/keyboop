@@ -4,7 +4,7 @@ import FluidAudio
 
 /// Распознавание речи через Parakeet (FluidAudio · CoreML · Apple Neural Engine).
 /// Офлайн по принципу №2: модель грузится из локальной папки, сеть в рантайме запрещена
-/// (`DownloadUtils.enforceOffline`). Скачивание модели — только по явной кнопке пользователя.
+/// (`ModelHub.offlineMode`). Скачивание модели — только по явной кнопке пользователя.
 /// Требует macOS 14+. API сверен по исходникам FluidAudio.
 final class ParakeetEngine {
     static let shared = ParakeetEngine()
@@ -83,7 +83,7 @@ final class ParakeetEngine {
         guard Self.modelInstalled else { kbLog("parakeet: модель не установлена"); return false }
         do {
             let t0 = ProcessInfo.processInfo.systemUptime
-            DownloadUtils.enforceOffline = true               // в рантайме — ноль сети (принцип №2)
+            ModelHub.offlineMode = true                       // в рантайме — ноль сети (принцип №2)
             let models = try await AsrModels.load(from: Self.modelDir, version: .v3)
             // ⚠️ ДЕРЖИМ ССЫЛКУ НА ЗАГРУЖЕННОЕ. Живой черновик работает на ТОЙ ЖЕ v3, и если он
             // загрузит свою копию, мы заплатим дважды: и памятью, и первой компиляцией CoreML под
@@ -145,7 +145,7 @@ final class ParakeetEngine {
     func download(progress: @escaping (Double) -> Void) async -> Bool {
         if await downloadFromMirror(progress: progress) { return true }
         do {
-            DownloadUtils.enforceOffline = false
+            ModelHub.offlineMode = false
             let models = try await AsrModels.downloadAndLoad(version: .v3, progressHandler: { p in
                 progress(p.fractionCompleted)
             })
@@ -154,11 +154,11 @@ final class ParakeetEngine {
             decoderLayers = await mgr.decoderLayerCount
             manager = mgr
             ready = true
-            DownloadUtils.enforceOffline = true
+            ModelHub.offlineMode = true
             kbLog("parakeet: модель скачана и загружена (HF-фолбэк, layers=\(decoderLayers))")
             return true
         } catch {
-            DownloadUtils.enforceOffline = true
+            ModelHub.offlineMode = true
             kbLog("parakeet: скачивание не удалось: \(error)")
             return false
         }
@@ -211,7 +211,7 @@ final class ParakeetEngine {
                 kbLog("parakeet mirror: распаковка/структура не сошлись (tar=\(p.terminationStatus)) — уходим на HF")
                 return false
             }
-            DownloadUtils.enforceOffline = true
+            ModelHub.offlineMode = true
             let models = try await AsrModels.load(from: dir, version: .v3)
             let mgr = Self.makeManager()
             try await mgr.loadModels(models)

@@ -235,7 +235,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         sidebarItem.maximumThickness = DS.sidebarWidth
         sidebarItem.canCollapse = false
         let detailItem = NSSplitViewItem(viewController: detail)
-        if #available(macOS 26.0, *) { detailItem.automaticallyAdjustsSafeAreaInsets = true }
         split.addSplitViewItem(sidebarItem)
         split.addSplitViewItem(detailItem)
 
@@ -2815,24 +2814,20 @@ final class DetailVC: NSViewController {
         kbLog("тема: \(settings.appTheme)")
     }
 
-    /// Обновления — ОТДЕЛЬНЫЙ раздел (раньше тонули в «Общих» → реальный пользователь не нашёл, где
-    /// обновлять). Зависимость: «Ставить сразу без вопросов» требует включённой проверки, поэтому при
-    /// нём тумблер «Проверять обновления» форсится ВКЛ и НЕДОСТУПЕН (нельзя выключить, не сняв silent).
+    /// Персональная сборка проверяет только наличие публичного исходного тега. Установочных
+    /// настроек здесь намеренно нет: приложение не содержит загрузчика или установщика обновлений.
     private func buildUpdates() -> NSView {
         let checkBtn = NSButton(title: L10n.t("upd.check"), target: self, action: #selector(checkForUpdates))
         checkBtn.bezelStyle = .rounded; checkBtn.controlSize = .regular
 
-        let silent = settings.silentAutoUpdate
-        let checkOn = silent ? true : UpdaterController.shared.automaticChecks   // при silent — форс ВКЛ
         return vstack([
             blockTitle("upd.title"),
             sub(L10n.t("upd.sub")),
             group(8),
             card([
-                switchRow(L10n.t("upd.check2"), L10n.t("upd.check2Sub"), checkOn, #selector(toggleAutoCheck), enabled: !silent,
+                switchRow(L10n.t("upd.check2"), L10n.t("upd.check2Sub"), UpdaterController.shared.automaticChecks,
+                          #selector(toggleAutoCheck),
                           help: L10n.t("upd.check2Help"), key: "upd.check2"),
-                switchRow(L10n.t("upd.silent"), L10n.t("upd.silentSub"), silent, #selector(toggleSilentUpdate),
-                          help: L10n.t("upd.silentHelp"), key: "upd.silent"),
                 switchRow(L10n.t("upd.beta"), L10n.t("upd.betaSub"), settings.betaChannel, #selector(toggleBetaChannel),
                           help: L10n.t("upd.betaHelp"), key: "upd.beta"),
                 buttonRow([checkBtn])
@@ -2847,8 +2842,7 @@ final class DetailVC: NSViewController {
     /// ⚠️ ЗАВЕДЕНО ПО ЖАЛОБЕ (03.08.2026): «скачал с сайта, пару дней обновлялось, потом перестало,
     /// нажимаю „Проверить обновления“ и ничего не происходит». Раньше срыв проверки уходил ТОЛЬКО
     /// в лог, и человек оставался с молчанием. Причин у срыва много и все снаружи: нет сети, VPN
-    /// режет домен, корпоративный фильтр, антивирус, запуск не из «Программ» (Sparkle отвечает на
-    /// это кодом 1005, ровно это видно в отчёте с Intel-мака). Ни одну мы не исправим, но человек
+    /// режет домен, корпоративный фильтр или антивирус. Ни одну мы не исправим, но человек
     /// обязан узнать, что обновления не работают: иначе он месяцами сидит на старой версии и пишет
     /// нам про давно починенное. Половина нашей почты именно такая.
     ///
@@ -2915,28 +2909,8 @@ final class DetailVC: NSViewController {
         DispatchQueue.main.async { [weak self] in self?.reshow() }
     }
     @objc private func toggleAutoCheck(_ s: NSSwitch) { UpdaterController.shared.automaticChecks = (s.state == .on) }
-    @objc private func toggleSilentUpdate(_ s: NSSwitch) {
-        settings.silentAutoUpdate = (s.state == .on)
-        // silent требует проверки → при включении форсим её ВКЛ; reshow перерисует раздел, и тумблер
-        // «Проверять обновления» станет вкл+серым (а при выключении silent — снова доступным).
-        if settings.silentAutoUpdate {
-            UpdaterController.shared.automaticChecks = true
-            // Апдейт мог быть уже скачан и ждать нашего уведомления — в тихом режиме его не будет,
-            // поэтому запускаем ожидание простоя прямо сейчас (иначе он висит до перезапуска).
-            UpdaterController.shared.noteSilentModeEnabled()
-        } else {
-            // Передумали: гасим взведённое ожидание, иначе оно доработает и поставит вопреки «нет».
-            UpdaterController.shared.cancelSilentWait()
-        }
-        // Откладываем на такт: reshow() сносит contentStack вместе с ЭТИМ ЖЕ NSSwitch, а на macOS 26
-        // это teardown его SwiftUI-графа изнутри собственного sendAction/анимации (см. RowMetrics).
-        DispatchQueue.main.async { [weak self] in self?.reshow() }
-    }
     @objc private func toggleBetaChannel(_ s: NSSwitch) {
         settings.betaChannel = (s.state == .on)
-        // Смена канала — это изменение того, ЧТО мы ищем, а не когда. Без перезавода цикла новый
-        // выбор доехал бы только к следующей плановой проверке, а у агента в строке меню она может
-        // быть через сутки: человек включил бету и решил бы, что тумблер не работает.
         UpdaterController.shared.noteChannelChanged()
     }
     @objc private func checkForUpdates() { UpdaterController.shared.checkNow() }

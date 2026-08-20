@@ -110,7 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = AppHealth.launchedAt   // ленивый static let: «потрогать» на старте, иначе аптайм в первом
                                    // багрепорте всегда «0с» и разбор уходит в ложную ветку
         installMainMenu()   // меню Edit (Cmd+V/C/X/A/Z) — иначе в текстовых полях не работает вставка
-        syncProcessLanguage()   // Sparkle и системные диалоги — на языке приложения (репорт 24.07)
+        syncProcessLanguage()   // системные диалоги — на языке приложения
         CapsRemap.reconcile()   // Caps-ремап не переживает перезагрузку (переприменить) и не должен
                                 // переживать выключенный тумблер (снять после падения без restore)
         GlobeKey.reconcile()    // роль 🌐: забрать при включённом режиме / вернуть после падения
@@ -327,22 +327,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self?.menuBar.refresh() }
         }
 
-        // Автообновления (Sparkle): по умолчанию спрашиваем НАШИМ баннером (две кнопки, AppBanner —
-        // без системных уведомлений), тихо — только если юзер выбрал «авто». Под dev-рендер-хуками
-        // не стартуем (без сетевых проверок).
-        UpdaterController.shared.onUpdateReady = { [weak self] v in self?.notifyUpdateReady(v) }
+        // Персональная сборка только сообщает о версиях, для которых уже опубликован исходный тег.
+        // В ней нет загрузчика или установщика приложения. Под render-хуками сеть не запускаем.
         let env = ProcessInfo.processInfo.environment
-        if (Bundle.main.bundleIdentifier ?? "").hasSuffix(".dev"), env["KEYBOOP_UPDATER"] != "1" {
-            // Dev-сборка НЕ проверяет прод-апкаст: Sparkle иначе может «обновить» dev-бандл
-            // прод-DMG — подмена под ногами + диалог с паролем посреди работы (23.07.2026).
-            // Прод-поведение Sparkle тестируем на прод-бандле из /Applications.
-            //
-            // KEYBOOP_UPDATER=1 снимает запрет для ОТЛАДКИ самого апдейтера: дважды за 30.07 правки в
-            // расписании проверок нельзя было увидеть иначе как выкатив релиз. Дыру 23.07 это не
-            // возвращает: в этом режиме UpdaterController принудительно гасит скачивание, то есть
-            // Sparkle может только спросить фид и записать в лог, но не принести и не подменить файл.
-            kbLog("updater: dev-сборка — автопроверка обновлений выключена")
-        } else if env["KEYBOOP_DUMP"] != "1", env["KEYBOOP_WINSHOT"] != "1",
+        if env["KEYBOOP_DUMP"] != "1", env["KEYBOOP_WINSHOT"] != "1",
            env["KEYBOOP_LIVEDIAG"] != "1", env["KEYBOOP_HISTDUMP"] != "1" {
             UpdaterController.shared.start()
         }
@@ -525,10 +513,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 AppBanner.shared.show(
                     title: String(format: L10n.t("upd.notifyTitle"), "0.0.0-проверка"),
-                    body: L10n.t("upd.notifyBody"),
+                    body: String(format: L10n.t("upd.notifyBody"), L10n.t("upd.kindBeta")),
                     actions: [
-                        .init(title: L10n.t("upd.now"), coral: false) { kbLog("БАННЕР-ТЕСТ: сработала левая кнопка «Обновить»") },
-                        .init(title: L10n.t("upd.autoShort"), coral: true) { kbLog("БАННЕР-ТЕСТ: сработала правая кнопка «Обновлять автоматически»") }
+                        .init(title: L10n.t("upd.review"), coral: true) { kbLog("БАННЕР-ТЕСТ: открытие сравнения") }
                     ])
             }
         }
@@ -990,27 +977,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    /// Готов апдейт → НАШ баннер вверху справа с двумя кнопками (без системных уведомлений и их
-    /// запроса разрешений — по просьбе автора). Ждёт решения; «Обновить» ставит, «Авто» включает тихий
-    /// режим. Закрыл/проигнорировал — переспросит на следующей проверке (или поставится при выходе).
-    private func notifyUpdateReady(_ version: String) {
-        AppBanner.shared.show(
-            title: String(format: L10n.t("upd.notifyTitle"), version),
-            body: L10n.t("upd.notifyBody"),
-            // ПОРЯДОК И ЦВЕТ — РЕШЕНИЕ ИВАНА 30.07. Слева серая «Обновить», справа коралловая
-            // «Обновлять автоматически». Обе ставят апдейт СРАЗУ, без второго окна; правая вдобавок
-            // включает тихие автообновления. Коралл на правой намеренно: это подсказка, куда нажать,
-            // чтобы больше не видеть эту плашку никогда. Раньше акцент стоял на «обновить один раз»,
-            // то есть мы сами уводили людей от автообновлений и потом удивлялись застрявшим версиям.
-            actions: [
-                .init(title: L10n.t("upd.now"), coral: false) { UpdaterController.shared.installPendingNow() },
-                .init(title: L10n.t("upd.autoShort"), coral: true) { UpdaterController.shared.enableSilentAndInstall() }
-            ],
-            // Крестик = «нет»: ничего не поставится ни сейчас, ни при выходе (отзыв #125).
-            onClose: { UpdaterController.shared.declinePending() }
-        )
-    }
-
     private func promptModelDownload() {
         let alert = NSAlert()
         alert.messageText = L10n.t("voice.needModelTitle")
@@ -1040,7 +1006,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Кросс-бандловый single-instance замок (flock по фикс-пути в Application Support). true — МЫ его
     /// взяли (единственная копия); false — уже держит другой Keyboop (ЛЮБОГО билда: dev и прод тоже).
     /// fd держим открытым весь процесс → замок жив до выхода (и авто-снимается при крэше — ядро закроет fd).
-    /// Короткий ретрай: при Sparkle-перезапуске новая копия может стартовать на миг раньше, чем старая
+    /// Короткий ретрай: при быстром перезапуске новая копия может стартовать на миг раньше, чем старая
     /// отпустит замок — даём ~2с освободиться, иначе ложно решим «уже запущен».
     private func acquireSingleInstanceLock() -> Bool {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -1051,7 +1017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard fd >= 0 else { return true }   // не смогли создать замок — НЕ блокируем запуск (fail-open)
         for attempt in 0..<10 {
             if flock(fd, LOCK_EX | LOCK_NB) == 0 { singleInstanceFD = fd; return true }
-            if attempt < 9 { usleep(200_000) }   // 200мс × 10 ≈ 2с на отпускание старой копией (Sparkle relaunch)
+            if attempt < 9 { usleep(200_000) }   // 200мс × 10 ≈ 2с на отпускание старой копией
         }
         close(fd)
         return false
@@ -1151,12 +1117,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CapsLED.shutdown(atExit: true)   // лампочке — обратно её системный смысл (состояние капса)
     }
 
-    /// Sparkle и прочие системные диалоги — на языке ПРИЛОЖЕНИЯ, а не только системы.
-    /// У нас нет .lproj-папок (своя L10n) → без этого процесс запускается английским, и строки
-    /// Sparkle.framework резолвятся в en, хотя ru.lproj в нём есть (баг-репорт:
-    /// «You're up to date» в русском интерфейсе). CFBundleAllowMixedLocalizations в Info.plist
-    /// разрешает фреймворкам локализоваться независимо; здесь досинхронизируем ЯВНЫЙ выбор языка
-    /// в настройках (вступает в силу со следующего запуска — Sparkle-диалоги не горят).
+    /// Системные диалоги — на языке ПРИЛОЖЕНИЯ, а не только системы.
+    /// У нас нет .lproj-папок (своя L10n), поэтому досинхронизируем явный выбор языка в настройках.
+    /// CFBundleAllowMixedLocalizations разрешает системным фреймворкам локализоваться независимо.
     private func syncProcessLanguage() {
         let d = UserDefaults.standard
         switch AppSettings.shared.language {

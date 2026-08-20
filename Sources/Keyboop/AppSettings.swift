@@ -523,13 +523,12 @@ final class AppSettings {
     /// Версия прошлого запуска — для подсказки про Accessibility после обновления (смена подписи →
     /// доступ протух). Пусто на первом запуске. Сравниваем с текущей в AppDelegate.
     var lastRunVersion: String { get { d.string(forKey: "lastRunVersion") ?? "" } set { d.set(newValue, forKey: "lastRunVersion") } }
-    /// Ставить обновления тихо, без вопроса (opt-in). По умолчанию FALSE — спрашиваем уведомлением
-    /// «Обновить сейчас / Обновлять автоматически». Пользователь жмёт «авто» → ставим тихо в простое.
-    var silentAutoUpdate: Bool { get { d.bool(forKey: "silentAutoUpdate") } set { d.set(newValue, forKey: "silentAutoUpdate") } }
-    /// Канал обновлений «бета»: человек ДОБРОВОЛЬНО получает сборки раньше всех, до обкатки.
-    /// Выключено по умолчанию и включается только вручную — иначе это не обкатка, а раздача сырого
-    /// всем сразу, то есть ровно то, от чего канал и защищает.
-    var betaChannel: Bool { get { d.bool(forKey: "betaChannel") } set { d.set(newValue, forKey: "betaChannel") } }
+    /// Показывать также публично доступные бета-теги. В персональной сборке это лишь уведомления:
+    /// никакие бинарники не скачиваются и не устанавливаются. По выбранной политике включено сразу.
+    var betaChannel: Bool {
+        get { d.object(forKey: "betaChannel") == nil ? true : d.bool(forKey: "betaChannel") }
+        set { d.set(newValue, forKey: "betaChannel") }
+    }
 
     /// Вид ЗНАЧКА в строке меню (автор 23.07, ред. — значок и язык независимы): brand — фирменный
     /// знак Keyboop и с 11.08 дефолт; keyboard — глиф клавиатуры (был дефолтом); hidden — значка нет.

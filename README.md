@@ -24,13 +24,13 @@
   Раскладка и регистр не важны.
 - 🔒 **Локально и приватно.** Из того, что ты печатаешь и говоришь, наружу не
   уходит ничего. Open source — можно проверить каждое слово.
-- 🍎 **Современно.** Apple Silicon, нотаризовано Apple, автообновления, свой
-  канал фидбэка прямо из приложения.
+- 🍎 **Современно.** Персональная Apple Silicon-сборка с постоянной локальной
+  подписью и безопасным уведомлением о новых публичных исходниках.
 
 ## Установка
 
-Скачай DMG на **[keyboop.com](https://keyboop.com)** — перетащи в Программы,
-разреши доступ к клавиатуре, для голоса выбери модель. Обновляется само.
+Официальную сборку можно скачать на **[keyboop.com](https://keyboop.com)**. Ниже
+описана самостоятельная персональная сборка: она не устанавливает обновления.
 
 Требуется: **Apple Silicon (M1 и новее) — macOS 14+**, либо **Intel — macOS 13+**.
 На Intel работает всё, кроме движка распознавания Parakeet: он живёт на нейропроцессоре
@@ -39,14 +39,14 @@ Apple, которого в Intel-маках нет. Голосовой набо�
 
 ## Сборка из исходников
 
-Нужны Xcode Command Line Tools и три внешние зависимости — их код чужой, в этот
+Нужны Xcode Command Line Tools и две внешние зависимости — их код чужой, в этот
 репозиторий он не входит, положи рядом в `vendor/`:
 
 ```bash
 mkdir -p vendor && cd vendor
 
 # 1. whisper.cpp — распознавание речи.
-git clone https://github.com/ggml-org/whisper.cpp
+git clone --branch v1.9.1 --depth 1 https://github.com/ggml-org/whisper.cpp
 cd whisper.cpp
 cmake -B build-macos14 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF \
@@ -60,23 +60,30 @@ cd ..
 macOS 15 — на macOS 14 приложение молча умрёт ещё до `main()`. Проверено на живых
 пользователях, чинилось экстренным релизом.
 
-Ещё две:
+Ещё одна:
 
-- **Sparkle** (автообновления) → `vendor/sparkle/Sparkle.framework` —
-  [релизы](https://github.com/sparkle-project/Sparkle/releases)
-- **FluidAudio** (Parakeet на Neural Engine) → `vendor/fluidaudio-prebuilt/` со
+- **FluidAudio v0.15.6** (Parakeet на Neural Engine) → `vendor/fluidaudio-prebuilt/` со
   `libFluidAudio.a`, `Modules/` и `include/` —
   [исходники](https://github.com/FluidInference/FluidAudio)
 
 Дальше:
 
 ```bash
-bash build-app.sh      # dev-сборка (self-signed) → Keyboop.app
-bash install-local.sh  # то же + установка в /Applications
+bash create-personal-signing-cert.sh  # один раз: постоянная локальная подпись
+bash build-app.sh                     # arm64 → Keyboop Personal.app
+bash install-local.sh                 # то же + установка в /Applications
 ```
 
-Готовые релизы подписаны Developer ID и нотаризованы Apple — скрипт релиза завязан
-на личные ключи и в репозиторий не входит.
+Сертификат и его случайный пароль хранятся только в двух игнорируемых Git-файлах
+`.personal-signing*` рядом с проектом. Их нужно сохранить вместе: тогда designated
+requirement не меняется и macOS не сбрасывает разрешения после каждой пересборки.
+Проектная связка добавляется в пользовательский список поиска связок, но не становится
+глобальным доверенным центром сертификации.
+
+Эта ветка делает личную self-signed сборку `ru.keyboop.app.personal`. Она не
+нотаризована Apple и при первом запуске требует ручного разрешения Gatekeeper.
+Встроенный монитор только сообщает о публичных исходных тегах и открывает сравнение
+на GitHub: скачивать или устанавливать новые версии приложения он не умеет.
 
 ## Авторы
 
