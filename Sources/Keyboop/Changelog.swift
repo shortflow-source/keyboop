@@ -3,16 +3,22 @@ import Foundation
 /// Журнал изменений для пользователя («Что нового»). Дописывать сверху при заметных правках.
 /// Кратко, в нашем тоне — не дев-журнал.
 enum Changelog {
-    /// `announce` / `announceEnd` — личные вступление и концовка ТОЛЬКО для анонса в Telegram: в окне
-    /// «Что нового» они не показываются. Раньше анонс был дословно списком изменений
-    /// (announce-telegram.sh берёт верхнюю запись отсюда), и живому «сижу ночами и чиню» просто негде
-    /// было находиться: в приложении оно неуместно, а второго источника не было. Порядок в посте:
-    /// announce → список изменений → announceEnd. Пусто — анонс уходит как раньше, одним списком.
+    /// `announce` / `announceItems` / `announceEnd` видит ТОЛЬКО Telegram: в окне «Что нового» они
+    /// не показываются. `ru` / `en` остаются точным и сухим пользовательским журналом, а Telegram
+    /// получает отдельные живые пункты с голосом автора. Порядок в посте: announce → announceItems →
+    /// announceEnd. Если announceItems нет, старые записи по-прежнему используют `ru`.
     struct Release {
         let version: String
         let ru: [String]
         let en: [String]
+        /// Версия вышла бетой. ⚠️ ТОЛЬКО ДЛЯ ЗАГОЛОВКА ЗАПИСИ, И ЭТО ВАЖНО (задача 189, автор 26.08).
+        /// Заголовок записи историчен: версия действительно вышла бетой, и это остаётся правдой
+        /// навсегда. А вот в шапке меню и «О программе» такой флаг начал бы врать: при переводе
+        /// в стабильные `promote-to-stable.sh` бинарь НЕ пересобирает, меняется только метка канала
+        /// в appcast, и зашитое в сборку слово «бета» пережило бы само событие.
+        var beta: Bool = false
         var announce: String? = nil
+        var announceItems: [String]? = nil
         var announceEnd: String? = nil
     }
 
@@ -54,6 +60,381 @@ enum Changelog {
         // 0.4 «Axolotl» — СРАЗУ СТАБИЛЬНАЯ, без беты (решение автора 17.08). Обычно крупное уходит
         // бетой, но эта версия неделю проверялась ревью в четыре измерения, стендами и глазами:
         // двенадцать подтверждённых дефектов закрыты до релиза, а не после него.
+        // 0.4.2 — БЕТА. Пять починок по живым отзывам плюс отмена нашей правки хоткеем. Бетой по той
+        // же причине, что и 0.4.1: правки лежат в горячем пути набора, и две из них (отмена и правило
+        // прилипшего Caps Lock) живут в Engine, который не покрыт ни одним стендом.
+        // 0.4.3 — БЕТА. Выпуск про скорость и про «не навреди». Главное в нём не новая функция, а
+        // снятая лишняя работа: при автоопределении языка распознавание шло ДВАЖДЫ по одной записи.
+        // Бетой по протоколу: правки лежат в диктовке и в исправлении опечаток, то есть в горячем
+        // пути, а исправление опечаток вдобавок лишилось целого правила, и это стоит обкатать на тех,
+        // кто вызвался сам.
+        // 0.4.4 — БЕТА. Выпуск про то, чтобы приложение не умирало целиком из-за чужого поля
+        // пароля. Бетой по протоколу и без вариантов: правки лежат в перехватчике событий и в
+        // путях записи, то есть в самом горячем месте проекта.
+        // 0.4.5 — про то, чтобы человек ВИДЕЛ: свой текст в форме отзыва, объяснение про скрытый
+        // ввод там, где его ищут, и канал версии в самом списке изменений. Кода в горячем пути нет.
+        // 0.4.6 — БЕТА. В выпуске есть диктовка, словарь, исправление опечаток и арбитраж горячих
+        // клавиш: всё это горячие пути ввода, поэтому только добровольный beta-канал. Реализация
+        // физического жеста остаётся в дереве за закрытым release-флагом и в эту версию не входит.
+        // 0.4.7 — БЕТА. Три узкие правки лежат прямо в горячем пути набора: пунктуация у исходного
+        // слова, дефисные токены и двойной пробел после автоконверсии. Цикл трёх раскладок в коде
+        // уже есть, но в список выпуска попадёт только после отдельного живого прогона автором.
+        // 0.4.8 — БЕТА. Единая история с буфером обмена это новая функция вокруг зашифрованного
+        // хранилища, а три правки из отзыва #232 лежат в детекторе и исправлении опечаток, то есть
+        // в горячем пути. Захват буфера выключен по умолчанию и буфер сам не трогает.
+        // 0.4.9 — СРАЗУ СТАБИЛЬНАЯ, осознанно против протокола (решение автора 24.09.2026). Протокол
+        // требовал бету: починки Spotlight и Siri меняют уровень, на который уходит наша синтетика.
+        // автор выбрал стабильную, зная, что вместе с ней стабильные пользователи с 0.4.7 получат и
+        // всё из беты 0.4.8, которая обкатывалась 12 дней. Откат, если понадобится, по разделу 6
+        // протокола: demote-from-stable.sh.
+        // 0.4.10 — БЕТА (решение автора 26.09.2026). Только починки, новых функций нет: с 26.09 Keyboop
+        // в режиме «только починки», пока автор работает над Aissia (см. CLAUDE.md). Бетой по протоколу:
+        // правки лежат в правке на лету, детекторе, таблице раскладок и отправке синтетики.
+        Release(version: "0.4.10",
+            ru: [
+                "Spotlight на macOS 27 снова работает. В этой версии macOS панель поиска переехала в другой системный процесс, и Keyboop её не узнавал: первая буква слова оставалась непереключённой, а если рядом работает программа вроде Magnet, исправленный текст уходил в окно под Spotlight.",
+                "Голосовой ввод на Whisper больше не теряет «Привет!», «Как дела?» и «How are you?» в начале диктовки, и русская речь в режиме «Авто» больше не выходит изредка английским переводом. Теперь Keyboop сначала определяет язык речи и подсказывает модели только на нём.",
+                "Правка на лету больше не превращает «ю», «б» и «ж» в середине слова в точку, запятую и точку с запятой: «переключение» больше не выходит «перекл.чение».",
+                "Firefox и браузеры на его движке: смена раскладки, регистра и перевод выделенного текста теперь печатают результат поверх выделения. Из-за ошибки в Firefox прежний способ портил текст вокруг выделения. Выделение из нескольких строк в Firefox пока не меняем, чтобы ничего не испортить.",
+                "Русские аббревиатуры заглавными (УФНС, МФТИ, ВГТРК, ФССП) больше не превращаются в латинский мусор. MACBOOK, API и JSON, набранные в русской раскладке, переключаются как раньше.",
+                "Правильно набранные технические сокращения со знаком в конце (txt., yml,, lgtm.) больше не превращаются в кириллицу, а «ече», набранное отдельным словом вместо txt, теперь переключается в txt. Так же работают yml, php, js, ts, md, src, cmd и ещё десяток сокращений разработчика.",
+                "Числа: запятая внутри числа при переводе в английскую раскладку становится точкой («5,5» → «5.5», а не «5?5»), а единицы после числа («5 г», «100 гб») остаются как набраны.",
+                "Раскладка «Русская – ПК»: «ё» на клавиатуре без клавиши «§» переводится в «`», а не в «§», а запятая в конце слова переводится правильно («Lf?» → «Да,»).",
+                "Keyboop предупреждает, если одна клавиша назначена на две его функции: 🌐 одновременно на мгновенную смену языка и на ручное переключение, или две функции на ⌥§ и ⌥`. Раньше одна из них молча не срабатывала.",
+                "Подсказка про скрытый ввод называет менеджеры паролей: например, Enpass с версии 6.12.6 держит защиту, пока его хранилище заблокировано. В диагностике отзыва видны все восемь сочетаний клавиш.",
+            ],
+            en: [
+                "Spotlight works again on macOS 27. In this macOS version the search panel moved to another system process and Keyboop did not recognise it: the first letter of a word stayed unconverted, and with a tool like Magnet running the corrected text went to the window under Spotlight.",
+                "Voice input on Whisper no longer drops «Привет!», «Как дела?» or «How are you?» at the start of a dictation, and Russian speech in Auto no longer occasionally comes out as an English translation. Keyboop now detects the language first and prompts the model in that language only.",
+                "Live correction no longer turns «ю», «б» and «ж» in the middle of a word into a period, comma or semicolon: «переключение» no longer comes out as «перекл.чение».",
+                "Firefox and browsers built on its engine: switching the layout, changing case or translating selected text now types the result over the selection. A bug in Firefox made the previous method damage the text around the selection. Multi-line selections in Firefox are left untouched for now so nothing gets damaged.",
+                "Russian all-caps abbreviations (УФНС, МФТИ, ВГТРК, ФССП) no longer turn into Latin gibberish. MACBOOK, API and JSON typed in the Russian layout still switch as before.",
+                "Correctly typed tech abbreviations with a trailing mark (txt., yml,, lgtm.) no longer turn into Cyrillic, and «ече» typed as a standalone word instead of txt now switches to txt, as do yml, php, js, ts, md, src, cmd and about ten more developer tokens.",
+                "Numbers: a comma inside a number becomes a period when converting to English («5,5» → «5.5», not «5?5»), and units after a number («5 г», «100 гб») stay as typed.",
+                "«Russian – PC» layout: on keyboards without the § key «ё» converts to «`» instead of «§», and a comma at the end of a word converts correctly («Lf?» → «Да,»).",
+                "Keyboop warns when one key is assigned to two of its functions: 🌐 both for instant language switching and manual conversion, or two functions on ⌥§ and ⌥`. Before, one of them silently never fired.",
+                "The hidden input hint names password managers: for example, Enpass since 6.12.6 keeps it on while its vault is locked. Feedback diagnostics list all eight shortcuts.",
+            ],
+            beta: true,
+            announce: """
+                Перемен у меня сейчас много, и не только рабочих, личных тоже. Поэтому приятно, что Keyboop в целом работает сам и есть не просит. Мелкие поломки чиню, как и обещал.
+
+                А скоро покажу, что мы делаем в компании: приложение той же породы, только намного функциональнее и круче. Keyboop, не ревнуй.
+                """,
+            announceItems: [
+                "Spotlight на macOS 27 снова работает: Apple переселила его и не предупредила.",
+                "Whisper больше не съедает «Привет!» в начале и не переводит русскую речь на английский без спроса.",
+                "«Переключение» больше не выходит «перекл.чение»: «ю» внутри слова перестала притворяться точкой.",
+                "Firefox: смена раскладки выделенного больше не портит текст вокруг (но это не точно).",
+                "УФНС и МФТИ остаются аббревиатурами, а «ече» наконец становится txt.",
+                "«5,5» переводится в «5.5», а не в «5?5».",
+            ],
+            announceEnd: """
+                Бета сама не приедет, включите «Ставить бета-версии».
+
+                Спасибо всем, кто поддерживает на keyboop.com/tips и присылает отзывы: половину выпуска нашли вы.
+                """),
+        Release(version: "0.4.9",
+            ru: [
+                "В Spotlight снова работает переключение раскладки, и автоматическое, и по сочетанию. В прошлой бете оно сломалось: исправленное слово уходило не в строку поиска, а в окно, открытое за ней. Так же вернулись Launchpad и другие панели, которые открываются поверх окон.",
+                "Mission Control больше не сжимает окна до точек. Это случалось после первого перевода по сочетанию: служебное окно переводчика, невидимое и стоящее далеко за краем экрана, попадало в раскладку Mission Control, и тот уменьшал всё остальное, чтобы уместить его в кадр. Раньше помогал только перезапуск Keyboop.",
+                "Историю можно хранить 7 или 30 дней. Варианты 2 и 4 часа из списка убраны; у кого они выбраны, срок остаётся прежним, пока вы не смените его сами. Потолок в 50 диктовок, действовавший при любом сроке, поднят до 3000, а окно истории показывает ленту порциями с кнопкой «Показать ещё»; поиск по-прежнему ищет по всей истории. Если новый срок короче и под него попадают записи, Keyboop сначала спросит.",
+                "Новая настройка в разделе моделей распознавания: «Выгружать модель после каждой диктовки». Она для Маков с небольшой памятью: модель уходит из памяти сразу после диктовки и загружается заново при следующем нажатии, пока вы говорите. Короткая фраза может закончиться на секунду-две позже, поэтому, если памяти хватает, оставьте её выключенной.",
+                "Буквенные сочетания в меню значка работают на русской и других нелатинских раскладках: «к» открывает «Сообщить о проблеме» так же, как «r».",
+                "Выделенные знаки без букв тоже переключаются, если знак можно набрать только в одной из раскладок: «^» становится запятой. Точку, запятую, скобки и другие знаки, которые есть в обеих раскладках, Keyboop не трогает: по ним не понять, что имелось в виду.",
+                "Мелочи. Окно знакомства, плашки и «О программе» снова показывают значок Keyboop, а не значок окна истории. Подзаголовки в настройках голосового набора стоят рядом со своими блоками, как в остальных разделах.",
+            ],
+            en: [
+                "Layout switching works in Spotlight again, both automatic and by shortcut. The previous beta broke it: the corrected word went not to the search field but to the window behind it. Launchpad and other panels that open over windows are back too.",
+                "Mission Control no longer shrinks windows to dots. It happened after the first translation by shortcut: the translator's service window, invisible and parked far off screen, got into Mission Control's layout, and it shrank everything else to fit it in. Only restarting Keyboop used to help.",
+                "History can be kept for 7 or 30 days. The 2 and 4 hour options are gone from the list; if you had one of them, it stays until you change it yourself. The 50-dictation cap that applied whatever the period is raised to 3000, and the History window shows the feed in portions with a “Show more” button; search still covers the whole history. If a new, shorter period would remove entries, Keyboop asks first.",
+                "A new setting in the recognition model section: “Unload the model after each dictation”. It is for Macs with little memory: the model leaves memory right after a dictation and loads again on the next press, while you speak. A short phrase may finish a second or two later, so if you have enough memory, leave it off.",
+                "Letter shortcuts in the menu-bar menu work on Russian and other non-Latin layouts: “к” opens “Report a problem…” just like “r”.",
+                "Selected symbols without letters are switched too when the symbol can only be typed in one of the layouts: “^” becomes a comma. Full stops, commas, brackets and other symbols that exist in both layouts are left alone: they do not say what was meant.",
+                "Small things. The welcome window, banners and About show the Keyboop icon again instead of the History window icon. Section headings in Voice input settings sit next to their blocks, as in the other sections.",
+            ],
+            announce: """
+                Час ночи, завтра на работу, а я выпускаю обновление.
+
+                Работаю product manager'ом, кажется, нашёл призвание и прямо кайфую. Работа съедает всё время и ещё чуть-чуть, но починки копились, и совесть победила сон.
+
+                На работе делаем похожий проект, только намного круче: одна голова хорошо, а пять лучше, особенно когда четыре из них ночью спят. Скоро расскажу.
+                """,
+            announceItems: [
+                "Spotlight и Launchpad снова работают.",
+                "Mission Control перестал сжимать окна в точки.",
+                "Историю можно хранить 7 или 30 дней, а не до конца рабочего дня.",
+                "Буквы в меню значка понимают русскую раскладку, а то было неловко.",
+                "Для Маков с малой памятью: «Выгружать модель после каждой диктовки».",
+            ],
+            announceEnd: """
+                Отзывы шлите всё равно: я вижу каждый, всё падает в базу и не теряется. Разбираю по очереди, с самого мешающего.
+
+                Спасибо всем, кто поддержал на keyboop.com/tips: выпуск собран на вашем чае и моём недосыпе. А звезда на GitHub дешевле чая: github.com/iffuno/keyboop
+                """),
+        Release(version: "0.4.8",
+            ru: [
+                "История стала общей для диктовок и буфера обмена. В окне истории одна лента по времени, у каждой записи видно, диктовка это или скопированный текст, а поиск ищет по обоим сразу. Запоминание буфера включается отдельным тумблером в разделе «Общие» и по умолчанию выключено; пока где-то открыто поле пароля, ничего не записывается, записи менеджеров паролей и собственные служебные операции Keyboop с буфером пропускаются. Только текст, зашифровано, с общими сроком хранения, паролем и очисткой.",
+                "В историю можно импортировать аудиофайл: кнопка внизу окна истории, рядом с настройками и очисткой. Файл расшифровывается на этом Mac тем же движком, что и диктовка, кусками с индикатором и отменой, поэтому годится и запись часового созвона. Текст ложится в ленту с абзацами по паузам, длинные записи показываются свёрнутыми, их можно сохранить в текстовый файл. Такие записи не удаляются по сроку хранения, только вручную.",
+                "«vvvv///» превращается в «мммм...», а «про,лему» и «соо,щаем» исправляются как опечатки. Общей замены запятой на «б» нет: она портила бы живые слова вроде «раз,или». Адреса и «www///» не трогаются.",
+                "Первая буква нового сообщения после Enter больше не наследует язык предыдущего. Отдельно закрыт случай «…iOS, nj»: короткий хвост после английского сокращения с запятой конвертируется, а «New, NJ» и «Loko vs CSKA» остаются как есть.",
+                "К отзыву разработчику можно приложить скриншот или короткое видео: PNG или JPEG до 10 МБ, MOV или MP4 до 25 МБ. Файл уходит разработчику в Telegram и на сервере не остаётся. Если текст дошёл, а файл нет, повторяется только файл.",
+                "Вопрос «Оставить слово как есть?» больше не висит бесконечно: без ответа он уходит через 20 секунд. Это не отказ: вопрос про то же слово вернётся после трёх новых откатов.",
+                "Смайлики больше не переключаются: «:D» превращалось в «:В», а «:C» и «=D» портились так же. Заодно исправлено исключение, записанное со знаком: добавленный в исключения «:D» раньше не срабатывал, потому что сравнение шло по буквам без двоеточия.",
+                "«ру» и «he» набираются одними клавишами, и теперь эта пара есть в списке спорных: в настройках можно выбрать, какая сторона побеждает.",
+                "В Figma переключение раскладки по выделению больше не съедает начало фразы. Из восемнадцати букв доезжало шесть, а короткое слово не менялось вовсе: Figma пропускала мимо себя первую клавишу после того, как Keyboop копировал выделенное. Теперь мы подставляем под этот удар пустую служебную клавишу, и текст приезжает целиком. Заодно перестала пропадать и первая буква, которую вы набираете сразу после переключения.",
+                "Последнюю диктовку можно вставить туда, где сейчас курсор. Для этого в настройках голосового набора, в разделе «История», появилось сочетание; кроме того, последняя диктовка стоит нулевой строкой в списке сниппетов, который открывается своим сочетанием, — там её вставляет цифра 0. Пригодится, когда диктовка закончилась, а курсор к тому моменту уехал в другое окно. Сочетание по умолчанию не назначено.",
+                "Голосовой ввод в режиме «Авто» больше не сваливается в русский, когда вы говорите по-английски. Причина была в подсказке, которую мы давали модели распознавания: она всегда была русской, и на английской речи модель продолжала русский текст вместо вашего. В «Авто» подсказки больше нет; при явно выбранном языке всё как было.",
+                "Мелочи, которые заметны каждый день. Значок в строке меню стал соразмерен соседним и больше не висит особняком. Аудиофайл можно просто перетащить на окно истории, а пока это окно открыто, у Keyboop есть значок в Доке. Своё сочетание при записи больше не нужно удерживать: нажали, отпустили, назначили — это касается и сниппетов, и смены регистра. Короткое сообщение во время расшифровки больше не прячет плашку «Распознаю» насовсем.",
+            ],
+            en: [
+                "History is now shared between dictations and the clipboard. The history window shows one timeline, each entry says whether it was dictated or copied, and search covers both at once. Remembering the clipboard is a separate switch in General settings and is off by default; nothing is recorded while a password field is open anywhere, and entries from password managers and Keyboop's own clipboard housekeeping are skipped. Text only, encrypted, with the shared retention, password and clearing.",
+                "An audio file can be imported into History: a button at the bottom of the History window, next to settings and clear. The file is transcribed on this Mac by the same engine as dictation, in pieces with a progress bar and cancel, so an hour-long call recording works too. The text lands in the feed with paragraphs at pauses, long entries are shown collapsed and can be saved to a text file. Such entries are not removed by retention, only by hand.",
+                "“vvvv///” becomes “мммм...”, and “про,лему” / “соо,щаем” are fixed as typos. There is no general comma-to-“б” replacement: it would break living words like “раз,или”. Addresses and “www///” are left alone.",
+                "The first letter of a new message after Enter no longer inherits the language of the previous one. The “…iOS, nj” case is closed separately: a short tail after an English abbreviation with a comma is converted, while “New, NJ” and “Loko vs CSKA” stay as they are.",
+                "Feedback to the developer can carry a screenshot or a short video: PNG or JPEG up to 10 MB, MOV or MP4 up to 25 MB. The file goes straight to the developer's Telegram and is not kept on the server. If the text made it and the file didn't, only the file is retried.",
+                "The “Keep the word as is?” question no longer hangs around forever: unanswered, it leaves after 20 seconds. That is not a refusal: the question about the same word comes back after three new reversals.",
+                "Emoticons are no longer switched: “:D” used to become “:В”, and “:C” and “=D” broke the same way. An exception saved with punctuation now works too: “:D” added to exceptions used to be ignored, because the comparison dropped the colon.",
+                "“ру” and “he” are typed with the same keys, so the pair is now in the ambiguous list: settings let you pick the winning side.",
+                "In Figma, converting the layout of a selection no longer eats the start of the phrase. Eighteen letters used to arrive as six, and a short word did not change at all: Figma swallowed the first key that came after Keyboop copied the selection. We now feed it a blank service key instead, and the text arrives whole. The first letter you type right after a conversion stops disappearing too.",
+                "The last dictation can be inserted wherever the caret is now. Dictation settings, the History block, has a shortcut for it; the last dictation is also the zeroth row of the snippet list that opens by its own shortcut, where the digit 0 inserts it. Handy when a dictation ends after the caret has already moved to another window. No shortcut is assigned by default.",
+                "Voice input in “Auto” no longer slides into Russian when you speak English. The cause was the hint we gave the recognition model: it was always Russian, so on English speech the model kept writing Russian instead of your words. In “Auto” there is no hint any more; with an explicitly chosen language nothing changes.",
+                "Small things you notice every day. The menu-bar icon is now the same size as its neighbours instead of sitting apart. An audio file can be dropped straight onto the History window, and while that window is open Keyboop gets a Dock icon. Recording your own shortcut no longer means holding the keys down: press, release, assign — snippets and case change included. And a brief message during transcription no longer hides the “Recognising” plate for good.",
+            ],
+            beta: true,
+            announce: """
+                150 дней
+
+                Столько прошло с того вечера, когда я снова полез в разработку. Образование у меня профильное, опыт когда-то был, но руками я не делал этого лет пятнадцать: снимал видео, собрал продакшн полного цикла, жил другой жизнью. Сел на вечер, пропал на пять месяцев.
+
+                За это время Keyboop научился диктовать, помнить, исправлять опечатки и не ломать буфер обмена. Оброс сайтом, каналом, историей и, что важнее, вами. Вы присылали логи, скриншоты и злые сообщения в три часа ночи, и половина того, что здесь работает, работает из-за этого.
+
+                А ещё за это время я нашёл работу. В прошлом выпуске я написал, что устраиваюсь, и вселенная, кажется, действительно читает релиз-ноты. Коллектив отличный, руководитель такой, у которого хочется учиться, и занимаюсь я там ровно тем, во что тут влюбился.
+
+                Спасибо технологиям. Кажется, у нас взаимно.
+
+                Теперь честно, что это значит для Keyboop.
+
+                Выпуски будут выходить реже, не чаще раза в неделю. По будням теперь работа, и сидеть до утра из-за одной точки больше не выйдет. Хотя хочется.
+
+                Баги чинить продолжу. Пишите через «Написать разработчику» прямо в приложении: я всё читаю и разбираю, каждое сообщение.
+
+                Нового функционала, скорее всего, не будет. На работе я делаю проект из этой же области, и всё новое теперь придумывается там. Когда его можно будет показать, я покажу.
+
+                Сам выпуск накопился за десять дней и получился большим.
+                """,
+            announceItems: [
+                "История теперь одна на всё: и то, что вы наговорили, и то, что скопировали. Один список, один поиск, всё так же зашифровано и никуда не уходит. Буфер запоминается отдельным тумблером и по умолчанию выключен.",
+                "В историю можно бросить аудиофайл, хоть часовой созвон. Расшифруется прямо на вашем Маке, без интернета, и ляжет в ленту абзацами по паузам.",
+                "Английская диктовка перестала выходить по-русски. Виноваты были мы: модели каждый раз подсовывали русскую подсказку, и она вежливо продолжала на русском.",
+                "В Figma переключение раскладки больше не откусывает начало фразы. Figma съедала первую клавишу после того, как мы копируем выделенное. Теперь мы подсовываем ей несъедобную.",
+                "Смайлик «:D» больше не превращается в «:В». А если вы добавили его в исключения, исключение наконец работает.",
+                "Последнюю диктовку можно вставить туда, где стоит курсор, отдельным сочетанием. Пригодится, когда договорил, а курсор к тому моменту уехал в другое окно.",
+                "К отзыву разработчику можно приложить скриншот или короткое видео.",
+                "Первая буква нового сообщения после Enter больше не наследует язык предыдущего.",
+            ],
+            announceEnd: """
+                А это для тех, кто читает до конца. Делал для себя: надоело перед каждым созвоном включать диктофон на телефоне, а потом пересылать себе файл. Доводить до ума и выносить в меню не стал, так что пусть остаётся тайной для своих.
+
+                ⌥-клик по значку Keyboop в строке меню начинает запись созвона, и микрофон, и звук из колонок сразу. Пока идёт запись, на значке красный кружок, чтобы про неё нельзя было забыть. Повторный ⌥-клик останавливает, и расшифровка ложится в историю. Если все замолчали, Keyboop сам спросит и через пару минут остановится. Всё считается на вашем Маке и никуда не уходит. Нужна macOS 14.2 и разрешение на запись звука.
+
+                И предупредите собеседника, что пишете. Это и вежливо, и во многих странах обязательно.
+
+                Остальные мелочи в «Что нового» внутри приложения.
+
+                Бета сама не приедет: включите «Ставить бета-версии» и нажмите «Проверить обновления».
+
+                Звёзд на GitHub всё ещё меньше, чем людей, которых Keyboop сегодня спас от «ghbdtn». Если спас вас, поставьте одну: github.com/iffuno/keyboop
+
+                Спасибо тем, кто закидывает на чай. В этот раз они ушли на препирательства с Figma и на зеркало, с которого вы качаете распознавание: keyboop.com/tips или boosty.to/iffun
+                """),
+        Release(version: "0.4.7",
+            ru: [
+                "Правильное слово с одним знаком пунктуации в конце больше не конвертируется частично. Например, «got it.» остаётся целиком английским вместо смешанного текста. Узкая защита работает при автоматическом исправлении; ручная конверсия по-прежнему выполняет явную команду пользователя.",
+                "Конвертация слов через дефис стала точнее. «xnj-nj» превращается в «что-то», «ult-nj» — в «где-то», а «bp-pf» — в «из-за». Командные флаги, диапазоны, идентификаторы, висячие и двойные дефисы не трогаются.",
+                "Точка по двойному пробелу надёжнее переживает автоматическую конверсию. В основном сценарии Keyboop сохраняет «. » независимо от того, успела ли macOS поставить точку сама. Более редкое совпадение второго пробела с самой синтетической заменой пока остаётся известным ограничением.",
+            ],
+            en: [
+                "A valid word with one trailing punctuation mark is no longer converted only in part. For example, “got it.” stays entirely English instead of becoming mixed-language text. This narrow protection applies to automatic correction; manual conversion still follows an explicit user command.",
+                "Hyphenated word conversion is more accurate. “xnj-nj” becomes “что-то”, “ult-nj” becomes “где-то”, and “bp-pf” becomes “из-за”. Command-line flags, ranges, identifiers, dangling hyphens, and doubled hyphens are left alone.",
+                "The double-space period survives automatic conversion more reliably. In the main timing case, Keyboop preserves “. ” whether or not macOS inserted the period first. A rarer overlap between the second space and the synthetic replacement remains a known limitation.",
+            ],
+            beta: true,
+            announce: """
+                Вселенная меня услышала. Судя по всему, она ещё и читает релиз-ноты: сейчас \
+                устраиваюсь на работу. На Keyboop останется меньше времени, зато режим «спорить с \
+                одной точкой до утра» будет включаться реже.
+
+                Я уже пользуюсь Keyboop каждый день и ругаюсь всё реже. Это не финальные титры: \
+                фидбэк читаю, ошибки чиню, новое добавляю. Просто теперь спокойнее.
+                """,
+            announceItems: [
+                "«got it.» больше не становится русско-английским дипломатическим кризисом: точка оставляет правильное слово в покое.",
+                "Слова через дефис теперь путешествуют вместе: «xnj-nj» становится «что-то», а технические конструкции не трогаем.",
+                "Точка по двойному пробелу надёжнее переживает автоконверсию. У macOS был свой авторский замысел.",
+            ],
+            announceEnd: """
+                Спасибо за донаты. Они финансируют исследования характера точки: \
+                keyboop.com/tips или boosty.to/iffun
+
+                Для самостоятельной подачи Keyboop в Homebrew Cask нужно немного звёзд. GitHub \
+                раздаёт их бесплатно, Homebrew почему-то считает всерьёз: github.com/iffuno/keyboop
+                """),
+        Release(version: "0.4.6",
+            ru: [
+                "Исходную запись диктовки теперь можно сохранить из истории как .m4a. Внутри Keyboop аудио по-прежнему хранится зашифрованным: открытые байты появляются только после того, как вы сами выбрали место сохранения. После экспорта запись остаётся в истории, а по сообщению об успехе можно сразу показать точный файл в Finder.",
+                "Словарь диктовки исправляет близкие варианты и превращает «Z-код» в «ZCode». Если модель ошиблась на одну или две буквы в длинном имени или термине, нужное написание всё равно подставится. Обычные слова языка, короткие совпадения и неоднозначные варианты не трогаем. «Зет-код» и «Z code» тоже становятся «ZCode».",
+                "«Не начинать с заглавной» больше не портит имена людей. Частые русские имена, их краткие и падежные формы, аббревиатуры и регистр из словаря диктовки сохраняются. В неоднозначных случаях имя важнее нарицательного: «Роман», «Вера» и «Лев» остаются с заглавной.",
+                "«Исправлять опечатки» теперь превращает «1ю8» в «1.8». Узкое правило понимает русскую «ю» между цифрами как промах мимо точки; оно работает только при включённом исправлении опечаток и не трогает обычные слова, заглавную «Ю» или «ю» у края числа.",
+                "Исключения с цифрами и точками работают, а обучение спрашивает только после трёх отмен. Проверка учитывает всю запись, работает при исправлении на лету и перед внешней точкой или запятой. Это не общее распознавание сайтов: адрес или технический токен по-прежнему нужно добавить в список самому. Первый и второй возврат одного слова проходят молча; если его не отменяли больше недели, счёт начинается заново. Закрытая без ответа плашка тоже требует три свежие отмены. Сама плашка теперь получила нормальные поля сверху и снизу.",
+                "Левый и правый Option больше не отбирают друг у друга действия. Правый Option можно оставить диктовке, а двойной левый Option отдать конверсии; старые конфликтующие настройки разводятся в работе, а новые конфликты интерфейс не даёт сохранить. Заодно Option+Shift больше не зависит от порядка, в котором отпущены клавиши.",
+                "Сторож 🌐 возвращает системное действие даже после падения и SIGKILL. Второй спящий процесс Keyboop теперь живёт всю сессию приложения и хранит проверяемую расписку восстановления; он не читает ввод и не выходит в сеть.",
+            ],
+            en: [
+                "The original dictation recording can now be saved from History as an .m4a file. Audio remains encrypted inside Keyboop: plaintext bytes appear only after you choose where to save them. Exporting leaves the history entry intact, and the success message can reveal the exact file in Finder.",
+                "The dictation dictionary corrects close matches and turns “Z-код” into “ZCode”. If the model misses one or two characters in a long name or term, the intended spelling can still be restored. Ordinary language words, short matches, and ambiguous guesses are left alone. “Зет-код” and “Z code” become “ZCode” too.",
+                "“No leading capital” no longer breaks people’s names. Common Russian names and their usual short and inflected forms, acronyms, and casing defined in the dictation dictionary keep their capitals. When a word is ambiguous, the name wins: “Роман”, “Вера”, and “Лев” stay capitalized.",
+                "“Fix typos” now turns “1ю8” into “1.8”. This narrow rule treats the Russian-layout letter “ю” between digits as a missed full stop; it runs only when typo correction is enabled and leaves ordinary words, capital “Ю”, and a “ю” at either edge of a number untouched.",
+                "Exceptions with digits and dots now work, and learning asks only after three reversals. Matching uses the complete token during live correction and before a trailing full stop or comma. This is not general website detection: the address or technical token still has to be added to the list. The first two reversals of the same word stay quiet; after more than a week without one, the count starts over. Closing the prompt without an answer also requires three fresh reversals. The prompt itself now has proper breathing room above and below its content.",
+                "Left and right Option no longer steal actions from each other. Right Option can belong to dictation while double-tapping left Option converts text; old conflicting settings are arbitrated at runtime and new conflicts are rejected in Settings. Option+Shift also no longer depends on key release order.",
+                "The 🌐 guard restores the system action even after a crash or SIGKILL. A second sleeping Keyboop process now stays for the app session and keeps a verifiable recovery receipt; it reads no input and makes no network requests.",
+            ],
+            beta: true,
+            announce: """
+                Keyboop стабилен: теперь чаще добавляю новое и прикольное, чем чиню старое.
+
+                Перехожу на Codex + ZCode: Claude Code слишком быстро съедает лимиты, даже \
+                максимального тарифа не хватает.
+
+                Ищу удалённую работу продактом или в видеопродакшне. Рекомендации: @iffun
+                """,
+            announceEnd: """
+                Это бета: включите «Ставить бета-версии» и нажмите «Проверить обновления».
+
+                Пригодился Keyboop? Поставьте звезду: github.com/iffuno/keyboop
+
+                Спасибо всем за донаты: keyboop.com/tips или boosty.to/iffun
+                """),
+        Release(version: "0.4.5",
+            ru: [
+                "Форма отзыва больше не прячет ваш текст. У трети отправителей поле ввода оказывалось вдвое шире окна, и строки обрезались по правому краю: из фразы просто выпадала середина. Жалоба жила с июля и пережила две починки, потому что на большинстве машин всё выглядело нормально. Нашли по диагностике, которую сами же и приложили к отзывам месяц назад.",
+                "Подпись у галочки диагностики перестала обрезаться на середине слова. Она делила строку с кнопкой «показать, что уйдёт», и не помещалась. Расшифровка, что именно уходит, и так стоит строкой ниже.",
+                "Скрытый ввод теперь объясняется словами, а не одной строчкой в меню. Когда какая-то программа включает защищённый ввод macOS, система прячет клавиши ото всех сразу, и переключение раскладки перестаёт работать у всех приложений разом. Раньше мы просто сообщали об этом и оставляли человека гадать. Теперь в настройках, в разделе «Приватность», появляется объяснение: что происходит, кто это обычно делает, что с этим делать и что при этом всё равно работает. Пока всё в порядке, раздел выглядит как раньше.",
+                "В списке изменений видно, что версия бета. Раньше пометка стояла в заголовке поста и на GitHub, а в самом приложении её не было, и просьба «включите бета-версии» выглядела загадочно.",
+            ],
+            en: [
+                "The feedback form no longer hides your text. For a third of senders the input field ended up twice as wide as its window, so lines were cut at the right edge and the middle of a sentence simply went missing. The complaint had been alive since July and survived two fixes, because on most machines everything looked fine. We found it in the diagnostics we ourselves had attached to reports a month earlier.",
+                "The diagnostics checkbox label no longer gets cut mid-word. It shared a row with the «see what's sent» button and did not fit. What exactly is sent is spelled out on the line below anyway.",
+                "Hidden input is now explained in words, not just announced in one line. When some app turns on macOS secure keyboard entry, the system hides keystrokes from everybody at once, and layout switching stops working across all apps. We used to report that and leave you guessing. Now Settings → Privacy explains what is happening, who usually does it, what to do about it and what still works meanwhile. While everything is fine, the section looks the way it always did.",
+                "The changelog now shows when a version is a beta. The mark used to be in the post title and on GitHub, but not inside the app, which made «turn on betas» read like a riddle.",
+            ],
+            beta: true,
+            announce: """
+                Личное. Я вообще оператор: снимаю давно, у меня продакшн полного цикла. Но спрос \
+                упал, и я ищу, чем заниматься дальше. За последнее время напридумывал и сделал \
+                столько продуктов, что ответ вроде очевиден: хочу делать продукты и дальше. Если \
+                знаете, где такие нужны, или можете посоветовать, напишите: @iffun
+
+                Этот выпуск про то, чтобы вы видели, что происходит: свой текст в форме отзыва, \
+                объяснение про скрытый ввод там, где его ищут, и честную пометку беты в самом списке.
+                """,
+            announceEnd: """
+                Бета сама не приедет: включите «Ставить бета-версии» и нажмите «Проверить обновления».
+
+                Спасибо всем, кто в эти дни присылал логи и скриншоты. Половину этого выпуска \
+                нашли именно по ним: keyboop.com/tips
+                """),
+        Release(version: "0.4.4",
+            ru: [
+                "Диктовка больше не умирает из-за чужого поля пароля. Когда любая программа включает защищённый ввод macOS, система прячет клавиши от всех сразу, и у нас замолкало вообще всё. По отзывам такое устраивали Почта, Chrome, Safari, Telegram и терминалы, у одного человека это случалось несколько раз в день. Теперь мы смотрим не на общий признак, а на само поле под курсором: если это поле пароля, молчим как раньше, а если обычное, диктовка работает.",
+                "Значок больше не гаснет, когда работать всё-таки можно. Потухший значок с треугольником читался однозначно: программа умерла. Заодно мы перестали называть в меню виноватую программу, потому что система сообщает её имя неточно и мы регулярно обвиняли невиновных. Вместо этого в подсказке значка написано, что происходит, что при этом работает и что помогает.",
+                "В мягком режиме короткие сочетания больше не превращаются в слова. В видеоредакторах и монтажках горячие клавиши это одиночные буквы, а пробел это воспроизведение, и две команды подряд складывались для нас в «до», «на» или «то» со всеми последствиями. Теперь в таких программах мы трогаем только слова длиннее двух букв и только набранные слитно.",
+                "Глобус и Fn наконец работают на ручном переключении. Раньше при таком назначении менялась только раскладка, а слово оставалось как было. Правка была готова к прошлому выпуску, но в него не попала.",
+                "После диктовки не пропадает слово, которое вы успели набрать сами. Уборка за диктовкой чистила буфер целиком, и если вы начинали печатать, пока текст ещё вставлялся, ваше слово исчезало вместе с чужим контекстом.",
+            ],
+            en: [
+                "Dictation no longer dies because of someone else's password field. When any app turns on macOS secure keyboard entry, the system hides keystrokes from everybody at once, and everything here went quiet. Reports named Mail, Chrome, Safari, Telegram and terminals; one person hit it several times a day. We now look at the field under the cursor rather than at the global flag: a password field still gets silence, an ordinary one gets your dictation.",
+                "The icon no longer dims while the app can still do its job. A dimmed icon with a warning triangle read as one thing only: the app is dead. We also stopped naming the app that is holding the keyboard, because the system reports that name unreliably and we kept accusing the innocent. The icon tooltip now explains what is happening, what still works and what helps.",
+                "In soft mode short key sequences no longer turn into words. In video editors the shortcuts are single letters and the space bar is playback, so two commands in a row added up to a valid Russian preposition and got converted. In those apps we now touch only words longer than two letters, and only ones typed as typing rather than pressed as commands.",
+                "Globe and Fn finally work for manual switching. Assigned that way they used to change only the layout and leave the word alone. The fix was ready for the previous release and missed it.",
+                "A word you typed yourself no longer disappears after a dictation. The cleanup after dictation wiped the whole buffer, so if you started typing while the text was still being inserted, your word went with it.",
+            ],
+            beta: true,
+            announce: """
+                Ездил на пару дней к родителям, ноутбук специально не брал. Помогал по \
+                хозяйству, не до кода было. Вернулся, а отзывов гора. Сел разбирать, и вот к \
+                ночи выпуск.
+
+                Оказалось, Keyboop умел умирать от чужого пароля. Любая программа открывает поле \
+                пароля, macOS прячет клавиатуру ото всех сразу, и мы честно замолкали. Люди так и \
+                писали: «программка просто умирает». Теперь не умирает.
+                """,
+            announceEnd: """
+                Бета сама не приедет: включите «Ставить бета-версии» и нажмите «Проверить обновления».
+
+                Спасибо всем, кто в эти дни писал про «скрытый ввод» и присылал логи. Без ваших \
+                отчётов я бы полгода думал, что это редкий случай: keyboop.com/tips
+                """),
+        Release(version: "0.4.3",
+            ru: [
+                "Каждая диктовка стала быстрее примерно на полсекунды. При автоопределении языка Whisper обрабатывал запись дважды: сначала чтобы понять, на каком языке говорят, потом чтобы получить текст. Теперь эта работа делается один раз. На фразах короче десяти секунд это почти вдвое, на длинных выигрыш тот же по времени, просто на общем фоне его меньше видно.",
+                "Исправление опечаток больше почти не портит правильные слова. Мы убрали самое опасное правило, замену буквы на соседнюю по клавиатуре: именно оно превращало «бампу» в «лампу», а «нужде» в «нужду». На живом тексте порча упала в девять раз. Настоящие опечатки чинятся по-прежнему, а теперь ещё и лишняя буква, нажатая дважды: «приивет» становится «привет».",
+                "Список известных опечаток вырос с двухсот до пяти тысяч. Чаще всего в русском ошибаются в сдвоенных согласных, поэтому туда попали «програма», «акаунт», «искуство» и ещё несколько тысяч таких же.",
+                "Caps Lock можно назначить на ручное переключение. Просили не раз: по прямому назначению клавиша почти никому не нужна, а лежит удобно. Пока она занята, настоящий капс включается через Shift с Caps Lock.",
+                "Значок в строке меню встал вровень с буквами языка. В прошлый раз мы измерили его неправильно и сдвинули не в ту сторону; теперь разница меньше половины пикселя.",
+                "В простых настройках поля выбора сочетаний стали одной ширины. Раньше поле диктовки было шире соседних, потому что подстраивалось под самый длинный вариант своего списка.",
+            ],
+            en: [
+                "Every dictation is about half a second faster. With automatic language detection Whisper processed each recording twice: once to work out the language, then again to produce the text. That work now happens once. On phrases under ten seconds it is close to twice as fast; on longer ones the saving is the same, it just shows up less against the total.",
+                "Typo correction almost never breaks correctly typed words any more. We removed its most dangerous rule, swapping a letter for its keyboard neighbour: that is what turned «бампу» into «лампу». Measured on real text, the damage fell ninefold. Real typos are still fixed, and now a letter typed twice is fixed too: «приивет» becomes «привет».",
+                "The list of known typos grew from two hundred entries to five thousand. Russian spelling trips people up most on doubled consonants, so that is what went in.",
+                "Caps Lock can now be assigned to manual switching. People asked more than once: almost nobody needs the key for what it does, and it sits comfortably under the finger. While it is taken, real caps lock is Shift with Caps Lock.",
+                "The menu bar icon now lines up with the language letters. Last time we measured it wrongly and nudged it the wrong way; the gap is now under half a pixel.",
+                "In the simple settings the shortcut pickers are all the same width. The dictation one used to be wider because it sized itself to the longest entry in its own list.",
+            ],
+            announce: """
+                График не возвращается: увлекаюсь и сижу до утра. И скучаю по съёмкам, их стало \
+                сильно меньше. Снимаю я хорошо и люблю это едва ли не больше, чем код, так что \
+                если вам или кому-то из ваших нужно видео, напишите мне в личку: @iffun
+
+                А выпуск про скорость: диктовка, оказывается, распознавала каждую запись дважды.
+                """,
+            announceEnd: """
+                Бета сама не приедет: включите «Ставить бета-версии» и нажмите «Проверить обновления».
+
+                Звёзд на GitHub неприлично мало для приложения, которое каждый день спасает кого-то \
+                от «ghbdtn». Если спасло вас, поставьте одну: github.com/iffuno/keyboop
+
+                Спасибо тем, кто пишет и кто закидывает на чай: keyboop.com/tips
+                """),
+        Release(version: "0.4.2",
+            ru: [
+                "«iOS» больше не превращается в «Ios». Правило про прилипший Caps Lock («пРИВЕТ» → «Привет») считало «iOS» такой же опечаткой: первая буква строчная, остальные заглавные. Теперь короткие имена не трогаются вовсе, а «mACOS» чинится в «macOS», то есть туда, куда вы и целились.",
+                "Первое нажатие сочетания отменяет нашу правку, а не переключает раскладку. Если Keyboop исправил слово, а вы этого не хотели, нажмите привычное сочетание, и слово вернётся как было. Второе нажатие работает как раньше.",
+                "«’nj» наконец превращается в «это». В раскладке «США международная» клавиша с «э» мёртвая: она сама по себе не отдаёт символа, поэтому пара для «э» у нас не создавалась вовсе. Заодно понимаем типографские апострофы, которые подставляет система.",
+                "Знаки препинания встают на свои места у тех, у кого включены обе русские раскладки. Таблицу мы строили по первой попавшейся, а обычная русская раскладка и её ПК-вариант расходятся на четырёх клавишах, включая точку и запятую. Теперь берём ту, которой вы пользуетесь.",
+                "Полоса прокрутки исчезает там, где прокручивать нечего. В разделах, которые помещаются целиком, она была чистым шумом, а там, где список длинный, осталась на месте.",
+            ],
+            en: [
+                "«iOS» no longer turns into «Ios». The stuck-Caps-Lock rule («пРИВЕТ» → «Привет») treated «iOS» as the same mistake: first letter lowercase, the rest uppercase. Short names are now left alone, and «mACOS» becomes «macOS», which is what you meant.",
+                "The first press of the shortcut undoes our edit instead of switching the layout. If Keyboop fixed a word and you did not want that, press your usual shortcut and the word comes back. A second press behaves as before.",
+                "«’nj» finally becomes «это». In the «U.S. International» layout the key carrying «э» is a dead key: on its own it produces nothing, so the pair for «э» was never built. Typographic apostrophes are understood too.",
+                "Punctuation lands correctly for people with both Russian layouts enabled. The table was built from whichever layout came first, and the plain Russian layout and its PC variant differ on four keys, including the period and the comma.",
+                "The scrollbar disappears where there is nothing to scroll. In sections that fit entirely it was pure noise; where the list is long it stays.",
+            ],
+            announce: """
+                Сейчас работаю параллельно над кучей проектов, и это отдельное удовольствие: \
+                приложения для iOS, сервисы, сайты. На все мои увлечения и фантазии не хватает \
+                уже двух максимальных тарифов, на Claude Code и на Codex.
+
+                Этот выпуск снова про починку, и почти всё в нём сделано по вашим письмам.
+                """,
+            announceEnd: """
+                Бета сама не приедет: включите «Ставить бета-версии» и нажмите «Проверить обновления».
+
+                Спасибо тем, кто пишет: половина этого выпуска родилась из ваших сообщений, \
+                причём самых дотошных. Поддержать проект: keyboop.com/tips
+                """),
         // 0.4.1 — БЕТА. Выпуск целиком про починку, новых функций нет. Три правки, каждая принята
         // стендом: двойная загрузка модели распознавания (первая диктовка ждала под сорок секунд),
         // исправление опечаток, портившее правильные слова (порча 4.93% → 1.39% корпуса), и

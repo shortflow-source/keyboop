@@ -9,11 +9,15 @@ protocol EventTapHandler: AnyObject {
     /// `post` — постинг ВНУТРИ колбэка (event.tapPostEvent(proxy)); nil, если путь недоступен.
     /// Возврат true = клавишу проглотить (сниппет раскрыт / inline-замена уже отправлена).
     func handleKeyDown(keyCode: Int64, characters: String, flags: CGEventFlags,
+                       eventTime: TimeInterval,
                        post: ((CGEvent) -> Void)?) -> Bool
     func handleSwitchHotkey()
     /// ТОЛЬКО смена языка (RU↔EN), без конвертации набранного — действие клавиши 🌐/Fn.
     func handleLayoutSwitchOnly()
-    func handleContextReset()
+    /// `at` — время САМОГО клика (секунды с загрузки, та же база, что systemUptime), а не
+    /// время доставки: монитор мыши асинхронный, и разница между ними бывает больше, чем интервал
+    /// между двумя нажатиями клавиш. См. Engine.applyPendingContextClear.
+    func handleContextReset(at eventTime: TimeInterval)
     /// Человек выбрал сниппет цифрой в списке (задача 17). Текст вставляется как есть,
     /// удалять нечего: триггер никто не печатал.
     func handleSnippetPicked(_ text: String)
@@ -22,6 +26,8 @@ protocol EventTapHandler: AnyObject {
     func handleTranslateHotkey()
     /// Смена регистра выделенного текста (задача 122).
     func handleCaseHotkey()
+    /// Вставить текст последней диктовки туда, где сейчас каретка (задача 242).
+    func handlePasteDictationHotkey()
 }
 
 /// Глобальный наблюдатель клавиатуры (CGEventTap, АКТИВНЫЙ `.defaultTap` — нужен Accessibility,
@@ -93,6 +99,20 @@ final class EventTap {
         let ns = stampIsNanos == true ? deltaTicksOrNs
                                       : deltaTicksOrNs * Double(timebase.numer) / Double(timebase.denom)
         return ns / 1_000_000
+    }
+
+    /// Момент самого системного события в секундах с загрузки. Нужен там, где важен ритм двух
+    /// физических клавиш: время ВХОДА в callback врёт, если очередь разом разгребла накопившиеся
+    /// события. `eventAgeMs` выше уже определил реальные единицы timestamp на этой машине.
+    private static func eventUptime(_ event: CGEvent) -> TimeInterval {
+        let stamp = event.timestamp
+        guard stamp > 0, let nanos = stampIsNanos else {
+            return ProcessInfo.processInfo.systemUptime
+        }
+        let valueNs = nanos
+            ? Double(stamp)
+            : Double(stamp) * Double(timebase.numer) / Double(timebase.denom)
+        return valueNs / 1_000_000_000
     }
 
     private var comboArmed = false
@@ -284,8 +304,9 @@ final class EventTap {
         if mouseMonitor == nil {
             mouseMonitor = NSEvent.addGlobalMonitorForEvents(
                 matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-            ) { [weak self] _ in
+            ) { [weak self] ev in
                 guard let self else { return }
+                let clickAt = ev.timestamp
                 // ⚠️ КЛИК СНИМАЕТ ВЗВОД ЖЕСТА ПО МОДИФИКАТОРУ (05.08.2026). Раньше клик только чистил
                 // набранное слово, а взвод оставался, и получалось вот что: перехватчик слушает
                 // ТОЛЬКО клавиатуру (keyDown/flagsChanged/keyUp), мышь в маску не входит. Значит
@@ -308,7 +329,7 @@ final class EventTap {
                 if SnippetPicker.shared.isOpen { onMain { SnippetPicker.shared.hide() } }
                 self.otherKeyBetweenTaps = true
                 self.otherKeyDuringCombo = true
-                self.handler?.handleContextReset()
+                self.handler?.handleContextReset(at: clickAt)
             }
         }
         return true
@@ -329,7 +350,7 @@ final class EventTap {
     /// системой, а с ним — «ввод не проходит нигде» (инцидент 21.07).
     @inline(__always) private func onMain(_ b: @escaping () -> Void) { DispatchQueue.main.async(execute: b) }
 
-    fileprivate func handle(type: CGEventType, event: CGEvent, proxy: CGEventTapProxy) -> Unmanaged<CGEvent>? {
+    func handle(type: CGEventType, event: CGEvent, proxy: CGEventTapProxy) -> Unmanaged<CGEvent>? {
         // Инструментовка: если колбэк вдруг стал медленным — увидим это ДО того, как система вырубит
         // тап, а не по факту потерянных нажатий.
         // ⚠️ МЕРЯЕМ ВОЗРАСТ СОБЫТИЯ, А НЕ ТЕЛО ОБРАБОТЧИКА (31.07). Прежний замер брал время от входа
@@ -339,6 +360,12 @@ final class EventTap {
         // микросекунды. Итог: семь реальных убийств тапа и НОЛЬ строк «МЕДЛЕННЫЙ колбэк». Единственный
         // ранний детектор врал «всё быстро» ровно тогда, когда у человека вставал ввод.
         // event.timestamp — наносекунды с загрузки в той же базе, что mach_absolute_time.
+        let sourceUserData = event.getIntegerValueField(.eventSourceUserData)
+        let origin = InputEventOrigin.classify(
+            sourceUserData: sourceUserData,
+            syntheticMarker: kbSyntheticMarker,
+            pauseMarker: kbPauseFixMarker
+        )
         let ageMs = Self.eventAgeMs(event)
         let tapT0 = CACurrentMediaTime()
         defer {
@@ -346,7 +373,7 @@ final class EventTap {
             // Порог по возрасту низкий сознательно: видимая человеку просадка начинается задолго до
             // того, как система решит нас вырубить, и лучше иметь запись заранее.
             if ageMs > 20 || bodyMs > 10 {
-                kbLog(String(format: "ввод придержан: событие пролежало %.0f мс, обработка %.1f мс", ageMs, bodyMs))
+                kbLog("ввод придержан: \(origin.label) · " + String(format: "событие пролежало %.0f мс, обработка %.1f мс", ageMs, bodyMs))
             }
         }
         // Пульс тапа: единственное доказательство, что события НАМ ЕЩЁ НОСЯТ. Одна запись на событие,
@@ -364,18 +391,29 @@ final class EventTap {
         // пустышка не должна трогать буфер и взводы хоткеев. keyUp у неё нет (мы его не шлём),
         // поэтому глотание не нарушает инвариант парности.
         if type == .keyDown,
-           event.getIntegerValueField(.eventSourceUserData) == kbPauseFixMarker {
+           sourceUserData == kbPauseFixMarker {
             (handler as? Engine)?.handlePauseFixMarker(post: { $0.tapPostEvent(proxy) })
             return nil
         }
         if (type == .keyDown || type == .keyUp),
-           event.getIntegerValueField(.eventSourceUserData) == kbSyntheticMarker {
+           sourceUserData == kbSyntheticMarker {
             return Unmanaged.passUnretained(event)
         }
-        // ПАУЗА: пропускаем событие насквозь, не разбирая. Стоит ЗДЕСЬ, после отсева собственной
-        // синтетики и до всей логики, чтобы молчали разом и авто-исправление, и хоткеи, и диктовка.
-        // Одно сравнение с часами, настройки не читаем (см. `Pause`).
-        if Pause.active { return Unmanaged.passUnretained(event) }
+        // ПАУЗА «НЕ МЕШАТЬ» ЗДЕСЬ БОЛЬШЕ НЕ ГЕЙТИТ (11.09.2026, решение автора в два шага).
+        //
+        // История. Сначала пауза глушила разом всё — и автоматику, и хоткеи, и диктовку; гейт стоял
+        // ровно тут, одним сравнением до всей логики. Утром 11.09 диктовку из-под паузы вывели
+        // белым списком по коду клавиши. Днём выяснилось, что белый список — не та граница:
+        // Escape (отмена диктовки) под него не попадал, ручная конверсия по комбинации тоже, а
+        // главное — буфер набора на паузе не наполнялся вовсе, и конвертировать «последнее слово»
+        // хоткею было бы нечего.
+        //
+        // Настоящая граница проходит не по клавишам, а по СМЫСЛУ: на паузе молчит только то, что
+        // приложение делает САМО (авто-конверсия на границе слова, живая починка, раскрытие
+        // сниппетов, конверсия перед Enter). Всё, что человек нажал сам, работает: диктовка и её
+        // Escape, ручная конверсия, регистр, сниппеты по цифре, мгновенное переключение. Поэтому
+        // тап обрабатывает события как обычно, а `Pause.active` проверяется в `Engine` ровно в тех
+        // точках, где рождается автоматическое действие. Список точек — у `Engine.handleKeyDown`.
         let s = AppSettings.shared
         // Системная клавиша (громкость/яркость/плеер) при зажатом модификаторе это аккорд, а не тап.
         // Гасим все взводы ровно как на обычной клавише и НИЧЕГО не глотаем.
@@ -518,6 +556,14 @@ final class EventTap {
             // выполняется на КАЖДОМ голом нажатии этой клавиши — и мы глотали её у всей системы.
             // Исключение — функциональные клавиши: F13 без модификаторов это осмысленный хоткей,
             // и напечатать её как текст нельзя, так что вреда нет (28.07).
+            // ⚠️ КЛАВИШУ ЗДЕСЬ СРАВНИВАЕМ СТРОГО, А НЕ ЧЕРЕЗ `keyMatches`, И ЭТО НАМЕРЕННО
+            // (26.09.2026, задача 244, ревью). Грейв 10 ≡ 50 у остальных семи хоткеев нужен для
+            // пресетов вроде «⌥`», а у мгновенного переключения пресетов на грейве нет: такое
+            // сочетание бывает только записанным с настоящей клавиши. На ISO 10 и 50 это
+            // две разные клавиши (§ под Esc и ` у левого ⇧), и сочетание «мгновенное ⌥§ + диктовка
+            // ⌥`» сегодня работает: каждая функция на своей клавише. Через `keyMatches` мгновенное
+            // забрало бы обе, и диктовка у такого человека умерла бы после обновления. Проверка
+            // конфликтов знает об этом исключении (`HotkeyGuard.graveIsOneKey`).
             if s.instantSwitchEnabled, s.instantSwitchMode == "key",
                keyCode == Int64(s.instantSwitchKeyCode),
                !isAssignableBare(keyCode, CGEventFlags(rawValue: s.instantSwitchMods)) {
@@ -548,6 +594,22 @@ final class EventTap {
                         onMain { RealCapsLock.toggle() }
                     } else {
                         onMain { [weak self] in self?.handler?.handleLayoutSwitchOnly() }
+                    }
+                }
+                return swallowDown(keyCode)
+            }
+            // Caps Lock, отданный РУЧНОМУ переключению (отзыв #160 и ещё несколько: «капс
+            // практически никогда не нужен, а в Punto так было можно»). Механизм тот же, что
+            // строкой выше, отличается только вызываемая функция: там смена языка, здесь конверсия
+            // последнего слова (она же отмена нашей автозамены).
+            // ⚠️ Ветка стоит ПОСЛЕ мгновенного переключения намеренно: если каким-то образом обе
+            // настройки указывают на Caps, выигрывает мгновенная смена языка, а не молчание.
+            if s.hotkeyMode == "modkey", s.hotkeyKeyCode == 57, keyCode == CapsRemap.lang1KeyCode {
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    if event.flags.contains(.maskShift) {
+                        onMain { RealCapsLock.toggle() }   // ⇧+Caps — единственный путь к настоящему замку
+                    } else {
+                        onMain { [weak self] in self?.handler?.handleSwitchHotkey() }
                     }
                 }
                 return swallowDown(keyCode)
@@ -594,6 +656,15 @@ final class EventTap {
             // передумал и продолжил печатать, отбирать у него нажатие за это нельзя.
             if SnippetPicker.shared.isOpen {
                 if keyCode == 53 { onMain { SnippetPicker.shared.hide() }; return swallowDown(keyCode) }
+                // Цифра `0` — нулевая строка «последняя диктовка» (задача 242). Своя цифра, ничью
+                // нумерацию не сдвигает; если строки на экране нет, клавиша человеку и остаётся.
+                if keyCode == 29, relevantMods(event.flags).isEmpty, SnippetPicker.shared.showsLastDictation {
+                    onMain { [weak self] in
+                        guard SnippetPicker.shared.pickLastDictation() else { return }
+                        self?.handler?.handlePasteDictationHotkey()
+                    }
+                    return swallowDown(keyCode)
+                }
                 if let d = Self.digitIndex(keyCode), let bank = Self.digitBank(relevantMods(event.flags)) {
                     // Нумерация продолжается модификаторами (автор 06.08): 1…9, затем ⇧1…⇧9, затем
                     // ⌘1…⌘9. Дальше только мышью — четвёртый ряд пришлось бы вешать на ⌥ или ⌃, а
@@ -628,7 +699,26 @@ final class EventTap {
             if s.caseChangeEnabled, keyMatches(keyCode, s.caseChangeKeyCode) {
                 let want = relevantMods(CGEventFlags(rawValue: s.caseChangeModifiers))
                 if !want.isEmpty, relevantMods(event.flags) == want {
-                    onMain { [weak self] in self?.handler?.handleCaseHotkey() }
+                    // Автоповтор зажатого сочетания гонял бы регистр туда-сюда: ЗАГЛАВНЫЕ, строчные,
+                    // ЗАГЛАВНЫЕ. Реагируем на первое нажатие, как соседние ветки.
+                    if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                        onMain { [weak self] in self?.handler?.handleCaseHotkey() }
+                    }
+                    return swallowDown(keyCode)
+                }
+            }
+            // Вставка последней диктовки. Стоит здесь же, среди «работы с чужим полем по сочетанию»,
+            // и ДО раскладочных веток: клавиша с модификаторами не должна дойти до конверсии.
+            if s.pasteDictationEnabled, keyMatches(keyCode, s.pasteDictationKeyCode) {
+                let want = relevantMods(CGEventFlags(rawValue: s.pasteDictationModifiers))
+                if !want.isEmpty, relevantMods(event.flags) == want {
+                    // Автоповтор зажатой клавиши обрабатывать нельзя: каждое повторение поставило бы
+                    // в очередь ещё одну полную вставку, и остановить их было бы нечем. Реагируем на
+                    // ПЕРВОЕ нажатие, как диктовка и мгновенное переключение. Глотаем при этом и
+                    // повторы тоже — иначе из-под зажатого сочетания посыплется сама буква.
+                    if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                        onMain { [weak self] in self?.handler?.handlePasteDictationHotkey() }
+                    }
                     return swallowDown(keyCode)
                 }
             }
@@ -678,7 +768,8 @@ final class EventTap {
             // sink живёт РОВНО на время колбэка: proxy валиден только здесь (Apple: использовать
             // его после возврата нельзя). Engine принимает его как обычное замыкание и не хранит.
             let post: (CGEvent) -> Void = { $0.tapPostEvent(proxy) }
-            if handler?.handleKeyDown(keyCode: keyCode, characters: chars, flags: event.flags, post: post) == true {
+            if handler?.handleKeyDown(keyCode: keyCode, characters: chars, flags: event.flags,
+                                      eventTime: Self.eventUptime(event), post: post) == true {
                 // Здесь НЕ регистрируем парность: за inline-замену учёт ведёт Engine
                 // (inlineSwallowedKeyCode → consumeInlineSwallowedKeyUp), и двойной учёт съел бы
                 // keyUp дважды. ⚠️ Но handleKeyDown возвращает true из ТРЁХ мест, а метку ставит
@@ -735,6 +826,55 @@ final class EventTap {
     private func handleFlags(_ flags: CGEventFlags, keyCode: Int64) -> Bool {
         if HotkeyRecording.active { return false }   // идёт запись комбинации — не перехватываем (см. keyDown)
         let s = AppSettings.shared
+        // АРБИТРАЖ СТАРЫХ КОНФЛИКТНЫХ НАСТРОЕК (#195). До проверки `sameTrigger` человек мог
+        // сохранить и «конверсия = 2×⌥ + диктовка = правый ⌥», и точное совпадение «обе функции =
+        // правый ⌥». Менять такую настройку при обновлении молча нельзя, но и запускать ДВА действия
+        // одним физическим нажатием нельзя. Правило рантайма детерминированное:
+        // `instant → voice → conversion`. Точный односторонний modkey старшей функции владеет своей
+        // клавишей; конверсия уступает её и в `modkey`, и в широком `doubletap`. Поэтому в первой
+        // паре правый ⌥ остаётся диктовке, 2× левый ⌥ — конверсии; в точной паре правый ⌥ целиком
+        // остаётся диктовке, пока человек не разнесёт настройки после предупреждения.
+        // Перевод сюда не входит: это обычная клавиша + модификаторы и приходит через `.keyDown`,
+        // а не через `.flagsChanged`.
+        //
+        // Важно сбросить и первый тап: иначе последовательность «левый ⌥ → правый ⌥ (другая
+        // функция) → левый ⌥» склеилась бы в двойной тап через уже выполненное чужое действие.
+        // Не читаем настройки остальных функций в обычном (заводском combo) пути: handleFlags —
+        // горячий системный callback, и этот редкий legacy-предохранитель не должен утяжелять его.
+        var conversionModifierClaimedHere = false
+        if s.hotkeyMode == "doubletap" || s.hotkeyMode == "modkey" {
+            let conversionTouchesThisKey: Bool
+            if s.hotkeyMode == "doubletap" {
+                let mask = relevantMods(CGEventFlags(rawValue: s.hotkeyModifiers))
+                conversionTouchesThisKey = HotkeyGuard.maskCovers(keyCode: Int(keyCode), mask: mask)
+            } else {
+                conversionTouchesThisKey = keyCode == Int64(s.hotkeyKeyCode)
+            }
+            if conversionTouchesThisKey {
+                let instantOwnsThisModifier = s.instantSwitchEnabled
+                    && s.instantSwitchMode == "modkey"
+                    && s.instantSwitchKeyCode != 57   // Caps живёт в LANG1/keyDown, не здесь
+                    && keyCode == Int64(s.instantSwitchKeyCode)
+                    && HotkeyGuard.maskCovers(
+                        keyCode: s.instantSwitchKeyCode,
+                        mask: relevantMods(CGEventFlags(rawValue: s.instantSwitchMods)))
+                let voiceOwnsThisModifier = s.voiceEnabled
+                    && s.voiceHotkeyMode == "modkey"
+                    && keyCode == Int64(s.voiceHotkeyKeyCode)
+                    && HotkeyGuard.maskCovers(
+                        keyCode: s.voiceHotkeyKeyCode,
+                        mask: relevantMods(CGEventFlags(rawValue: s.voiceHotkeyModifiers)))
+                conversionModifierClaimedHere = instantOwnsThisModifier || voiceOwnsThisModifier
+            }
+        }
+        if conversionModifierClaimedHere {
+            if s.hotkeyMode == "doubletap" {
+                lastModTap = 0
+                otherKeyBetweenTaps = false
+            } else {
+                modkeyArmed = false
+            }
+        }
         // Щёлкнули НАСТОЯЩИЙ капс (клавиша не занята сменой языка — иначе она ремапнута и сюда не
         // приходит): ОС в этот момент сама зажигает/гасит лампочку под состояние капса, а у нас она
         // индикатор ЯЗЫКА. Возвращаем ей наш смысл (событие не трогаем — капс работает как обычно).
@@ -764,9 +904,16 @@ final class EventTap {
             }
             fnArmed = false
             modkeyArmed = false
-            voiceModArmed = false
             otherKeyBetweenTaps = true    // «между тапами что-то было» — доказать обратное нечем
             otherKeyDuringCombo = true    // то же для комбинации
+            // ⚠️ ДИКТОВКУ СО ВЗВОДА НЕ СНИМАЕМ (25.08.2026, отзывы #163, #166, #173, #185, #189).
+            // Разоружение выше защищает от НАСТОЯЩЕГО бага: жест смены языка нельзя доказать
+            // чистым, пока обычные клавиши скрыты, и человек получал «переключает после первой
+            // буквы» (#46). Но у диктовки цена ошибки другая и несравнимо меньше: ложный старт
+            // человек видит сразу по плашке и отменяет, ничего не испортив. А цена молчания
+            // оказалась высокой — под чужим залипшим флагом умирала ровно диктовка, и именно её
+            // люди хоронили словами «программка просто умирает».
+            // Писать ей теперь тоже есть куда: `SecureInputPolicy` пускает запись в обычное поле.
         }
         // ⚠️ Гасим взвод одиночного модификатора ПЕРВЫМ ДЕЛОМ (ревью 28.07 — репорт #17 был закрыт
         // лишь наполовину). Если вторая клавиша комбинации это клавиша мгновенного переключения,
@@ -875,7 +1022,23 @@ final class EventTap {
                     onMain { [weak self] in self?.handler?.handleVoiceEnd() }
                 }
             }
-            return false
+            // ⚠️ НЕ ВЫХОДИТЬ ИЗ ФУНКЦИИ ПОСЛЕ ЭТОГО БЛОКА (фикс 28.08.2026, отзыв #204). Здесь
+            // стоял `return false` — ТОТ ЖЕ ДЕФЕКТ, что чинили 30.07 в соседней ветке `combo`
+            // (репорт #55), где над блоком висит такое же предупреждение. В modkey ранний выход
+            // остался и делал недостижимым весь разбор хоткея конверсии ниже, как только keyCode
+            // совпал с клавишей диктовки.
+            //
+            // ЧТО ЭТО ЛОМАЛО НА ЗАВОДСКИХ НАСТРОЙКАХ, а не только у автора отзыва. Конверсия по
+            // умолчанию это combo ⌥⇧, диктовка — правый ⌥ (keyCode 61). Ветка combo — конечный
+            // автомат по флагам, и выстрел у неё на «отпущено всё». Жмём ⌥⇧ ПРАВЫМ Option,
+            // отпускаем ⇧, потом ⌥: последнее отпускание уходило в ранний выход, combo не видела
+            // пустой набор и НЕ СТРЕЛЯЛА. Отпустил в обратном порядке — сработало. Снаружи это
+            // «конверсия иногда не срабатывает», и виновата сторона Option плюс порядок пальцев.
+            //
+            // Для НОВЫХ назначений двойное срабатывание закрывает интерфейс
+            // (`HotkeyGuard.sameTrigger`). Для уже сохранённой пары 2×⌥ + правый ⌥ ниже действует
+            // явный runtime-арбитраж: точный voice-modkey выигрывает свою сторону. А провал вниз
+            // всё равно обязателен для заводской совместимой пары combo ⌥⇧ + правый ⌥.
         }
         // Voice combo (напр. ⌥⌘) — режима не существовало до 29.07, поэтому записать сочетание из
         // двух модификаторов было нельзя в принципе: рекордер предлагал одиночную клавишу, а движок
@@ -917,6 +1080,9 @@ final class EventTap {
         switch s.hotkeyMode {
         case "modkey":
             // Конкретная клавиша-модификатор (правый ⌥ = keyCode 61 и т.п.) — tap по отпусканию.
+            // Не возвращаемся из общего voice-блока выше: это сломало бы заводской combo ⌥⇧.
+            // Вместо этого гасим ТОЛЬКО точную legacy-коллизию modkey × modkey.
+            if conversionModifierClaimedHere { break }
             let mask = CGEventFlags(rawValue: s.hotkeyModifiers)
             guard !mask.isEmpty else { return false }
             if keyCode == Int64(s.hotkeyKeyCode) {
@@ -940,6 +1106,11 @@ final class EventTap {
             // Двойное нажатие модификатора (напр. 2× Shift) в окне ~300 мс без других клавиш.
             let mask = CGEventFlags(rawValue: s.hotkeyModifiers)
             guard !mask.isEmpty else { return false }
+            // Точный modkey другой включённой функции выигрывает свою физическую сторону. Это
+            // runtime-предохранитель для уже сохранённых конфликтов; новые назначения по-прежнему
+            // блокирует HotkeyGuard, а настройки здесь не переписываются. Сброс состояния сделан
+            // выше ДО раннего `return` instant-пути, поэтому правило одинаково для instant/voice.
+            if conversionModifierClaimedHere { break }
             let pressed = !flags.intersection(mask).isEmpty
             // ⚠️ ТОЛЬКО В ОДИНОЧКУ: чужой модификатор рядом отменяет жест (репорт #73, 03.08.2026).
             //
@@ -1016,7 +1187,13 @@ final class EventTap {
     /// Тот же путь, что и по хоткею, но из меню (быстрое действие, задача 21). Держим ОДНУ
     /// реализацию: развилка start/stop атомарна (VoiceGate.flip), и второй копии этой логики
     /// быть не должно, иначе рассинхрон вернётся.
-    func toggleVoiceExternally() { toggleVoice() }
+    func toggleVoiceExternally() {
+        // Меню и шлепок доступны даже когда сама функция выключена в настройках. Без этого guard
+        // VoiceGate флипался в active, а VoiceController.begin() сразу выходил — следующее нажатие
+        // считалось «остановкой» несуществующей записи. Живую запись остановить всё равно разрешаем.
+        guard AppSettings.shared.voiceEnabled || VoiceGate.isActive else { return }
+        toggleVoice()
+    }
 
     private func toggleVoice() {
         // Решение start/stop — СИНХРОННОЕ и атомарное (VoiceGate.flip), иначе быстрый второй тап
@@ -1042,10 +1219,13 @@ final class EventTap {
     /// на ANSI и ISO: ANSI grave=50; ISO — под Esc § (keyCode 10), а грейв уезжает к левому Shift (тоже 50).
     /// Пользователь жмёт «где ожидает тильду» (под Esc) → на ISO это 10. Считаем 10 и 50 взаимозаменяемыми,
     /// чтобы хоткей на `` ` `` срабатывал на ЛЮБОЙ клавиатуре (research 01.07). Прочие клавиши — строго ==.
+    ///
+    /// ⚠️ ТАБЛИЦА ЖИВЁТ В `HotkeyGuard.sameKey` (26.09.2026, задача 244), рядом с таблицей
+    /// модификаторов и по той же причине: проверка конфликтов в интерфейсе обязана считать клавиши
+    /// ровно так же, как их ловим здесь. Копия {10, 50} здесь и строгое `==` там дали две наши
+    /// функции на одной клавише без единого предупреждения.
     private func keyMatches(_ pressed: Int64, _ stored: Int) -> Bool {
-        if pressed == Int64(stored) { return true }
-        let grave: Set<Int> = [10, 50]
-        return grave.contains(Int(pressed)) && grave.contains(stored)
+        HotkeyGuard.sameKey(Int(pressed), stored)
     }
 
     /// Можно ли реагировать на эту клавишу с ТАКИМ набором модификаторов.
@@ -1057,12 +1237,13 @@ final class EventTap {
     }
 
     /// keyCode принадлежит модификатору из mask (левый ИЛИ правый).
+    ///
+    /// ⚠️ ТАБЛИЦА ОДНА НА ПРИЛОЖЕНИЕ И ЖИВЁТ В `HotkeyGuard` (28.08.2026). Копий было две, и они
+    /// разошлись: здесь двойной тап принимал ОБЕ клавиши модификатора, а проверка конфликтов в
+    /// интерфейсе сравнивала keyCode и считала левый ⌥ и правый ⌥ разными комбинациями. Отсюда
+    /// отзыв #204: «двойной ⌥» назначился поверх диктовки на правом ⌥ без единого предупреждения.
     private func keyCodeMatchesMask(_ kc: Int64, _ mask: CGEventFlags) -> Bool {
-        if mask.contains(.maskShift) && (kc == 56 || kc == 60) { return true }
-        if mask.contains(.maskAlternate) && (kc == 58 || kc == 61) { return true }
-        if mask.contains(.maskCommand) && (kc == 55 || kc == 54) { return true }
-        if mask.contains(.maskControl) && (kc == 59 || kc == 62) { return true }
-        return false
+        HotkeyGuard.maskCovers(keyCode: Int(kc), mask: mask)
     }
 
     private func relevantMods(_ flags: CGEventFlags) -> CGEventFlags {

@@ -50,6 +50,27 @@ enum L10n {
         return ru ? "\(m) мин" : "\(m) min"
     }
 
+    /// Подпись срока хранения истории по минутам (0 значит «не удалять»). Пункты 2 и 4 часа
+    /// из списка убраны 24.09.2026, но их подписи живут: у кого они выбраны, тот видит свой
+    /// вариант (`HistoryPolicy.retentionMenu`).
+    static func retentionTitle(_ mins: Int) -> String {
+        switch mins {
+        case 0: return t("ret.never")
+        case 30: return t("ret.30m")
+        case 60: return t("ret.1h")
+        case 120: return t("ret.2h")
+        case 240: return t("ret.4h")
+        case 480: return t("ret.8h")
+        case 7 * 24 * 60: return t("ret.7d")
+        case 30 * 24 * 60: return t("ret.30d")
+        default:
+            let ru = current == .ru
+            if mins % (24 * 60) == 0 { let d = mins / (24 * 60); return ru ? "\(d) дн." : "\(d) d" }
+            if mins % 60 == 0 { let h = mins / 60; return ru ? "\(h) ч" : "\(h) h" }
+            return ru ? "\(mins) мин" : "\(mins) min"
+        }
+    }
+
     private static let strings: [String: [Lang: String]] = [
         "tagline":        [.ru: "wrong layout? keyboop.", .en: "wrong layout? keyboop."],
 
@@ -94,9 +115,10 @@ enum L10n {
         // Слово «Pro» одинаково в обоих языках (решение автора 11.08): короткого и понятного
         // русского эквивалента не нашлось, а смысл поясняет подпись под тумблером.
 
-        // Быстрые действия по правому клику и пауза (задача 21, 05.08.2026)
-        "quick.title":    [.ru: "Быстрое действие правым кликом", .en: "Quick action on right click"],
-        "quick.sub":      [.ru: "Левый клик по значку открывает меню, правый сразу делает выбранное", .en: "Left click opens the menu, right click does the chosen thing at once"],
+        // Быстрые действия по правому клику и шлепку (задачи 21 и 35)
+        "quick.title":    [.ru: "Быстрые действия", .en: "Quick actions"],
+        "quick.sub":      [.ru: "Правый клик и шлепок настраиваются независимо. Левый клик по значку по-прежнему открывает меню.", .en: "Right click and slap are configured independently. Left click still opens the menu."],
+        "quick.subNoSlap":[.ru: "Выбери действие по правому клику. Левый клик по значку по-прежнему открывает меню.", .en: "Choose what right click does. Left click still opens the menu."],
         "quick.copyVoice":[.ru: "Копировать последнюю диктовку", .en: "Copy the last dictation"],
         // ⚠️ ИМЯ ФУНКЦИИ ЖИВЁТ В ЧЕТЫРЁХ СТРОКАХ СРАЗУ (переименование, автор 07.08). Было
         // «Помолчать», и оно путалось с нашей же настройкой «без звуков»: читалось как «выключи
@@ -104,8 +126,9 @@ enum L10n {
         // «Не беспокоить». Меняя одну из этих строк, меняй все: пункт меню, подпись в настройках,
         // тост и строку активной паузы это ОДНА функция, и звать её надо одинаково.
         "quick.pause":    [.ru: "Не мешать", .en: "Do not disturb"],
-        "quick.dictate":  [.ru: "Начать диктовку", .en: "Start dictation"],
-        "quick.history":  [.ru: "Открыть историю диктовок", .en: "Open the dictation history"],
+        "quick.dictate":  [.ru: "Включить или выключить диктовку", .en: "Toggle dictation"],
+        "quick.history":  [.ru: "Открыть историю диктовки и буфера", .en: "Open the dictation and clipboard history"],
+        "quick.manualSwitchOrUndo":[.ru: "Переключить вручную / отменить", .en: "Switch manually / undo"],
         // Сниппеты как ОТДЕЛЬНЫЙ список (решение автора 06.08.2026)
         "snip.textsTitle":[.ru: "Сниппеты для вставки", .en: "Snippets to insert"],
         "snip.textsSub":  [.ru: "Отдельный список. Автозамена срабатывает сама по аббревиатуре, а это вставляется осознанно: длинные команды, реквизиты, шаблоны писем.", .en: "A separate list. Autoreplace fires by itself on an abbreviation; these are inserted deliberately: long commands, bank details, letter templates."],
@@ -118,17 +141,30 @@ enum L10n {
         "snip.pickCustom":[.ru: "Назначить свою…", .en: "Set your own…"],
         // Выбор сниппета по хоткею (задача 17, 06.08.2026)
         "snip.pickHotkey":[.ru: "Вставить сниппет по сочетанию", .en: "Insert a snippet by shortcut"],
-        "snip.pickHint":  [.ru: "Нажмите сочетание — появится список, дальше цифра 1-9. Удобно для того, что не хочется вешать на аббревиатуру: длинные команды, реквизиты, шаблоны писем.", .en: "Press the shortcut for a list, then a digit 1-9. Handy for what you would rather not bind to an abbreviation: long commands, bank details, letter templates."],
+        "snip.pickHint":  [.ru: "Нажмите сочетание — появится список, дальше цифра 1-9. Удобно для того, что не хочется вешать на аббревиатуру: длинные команды, реквизиты, шаблоны писем. Нулевой строкой в списке стоит последняя диктовка, если её есть чем вставить.", .en: "Press the shortcut for a list, then a digit 1-9. Handy for what you would rather not bind to an abbreviation: long commands, bank details, letter templates. The zeroth row is the last dictation, whenever there is one to insert."],
         "snip.pickOff":   [.ru: "Выключено", .en: "Off"],
         "snip.pickTip":   [.ru: "цифра вставит · Esc закроет", .en: "a digit inserts · Esc closes"],
         "snip.pickTipMore":[.ru: "цифра · ⇧цифра · ⌘цифра вставят, дальше мышью · Esc закроет", .en: "digit · ⇧digit · ⌘digit insert, the rest by mouse · Esc closes"],
         "snip.pickEmpty": [.ru: "Список автозамен пуст", .en: "The snippet list is empty"],
+        // Нулевая строка списка (задача 242): вставить последнюю диктовку, цифра «0».
+        "snip.pickDictation": [.ru: "Диктовка", .en: "Dictation"],   // ⚠️ КОРОТКО: колонка названий ограничена 120 pt, «Последняя диктовка» обрезалась многоточием (снимок 07.09). Что диктовка ПОСЛЕДНЯЯ, видно по самому тексту в строке.
         "quick.action":   [.ru: "Действие", .en: "Action"],
+        "quick.rightClick":[.ru: "Правый клик", .en: "Right click"],
+        "quick.slap":     [.ru: "Шлепок по MacBook", .en: "Slap the MacBook"],
+        "quick.slapSub":  [.ru: "Лёгкий шлепок по корпусу запускает выбранное действие", .en: "A light tap on the case runs the chosen action"],
+        "quick.slapChecking": [.ru: "Проверяю встроенный датчик…", .en: "Checking the built-in sensor…"],
+        "quick.slapReady": [.ru: "Датчик готов — лёгкий шлепок запускает действие", .en: "Sensor ready — a light tap runs the action"],
+        "quick.slapUnavailable": [.ru: "Встроенный датчик сейчас недоступен", .en: "The built-in sensor is currently unavailable"],
+        "quick.slapAction":[.ru: "Действие при шлепке", .en: "Action on slap"],
+        "quick.slapSound": [.ru: "Звук при срабатывании", .en: "Sound when triggered"],
+        "quick.sensitivity": [.ru: "Чувствительность", .en: "Sensitivity"],
+        "quick.sensitivity.balanced": [.ru: "Сбалансированная", .en: "Balanced"],
+        "quick.sensitivity.high": [.ru: "Высокая", .en: "High"],
         "quick.settings": [.ru: "Открыть настройки", .en: "Open settings"],
         "quick.help":     [.ru: "Правый клик по значку Keyboop в строке меню (рядом с часами) сразу делает выбранное, не открывая меню. Левый клик по-прежнему открывает меню.", .en: "Right-clicking the Keyboop icon in the menu bar (up by the clock) does the chosen thing at once, without opening the menu. Left click still opens the menu."],
         "quick.helpOff":  [.ru: "Сейчас недоступно: значок Keyboop убран из строки меню, а кликать не по чему. Верните значок или индикатор языка в разделе «Строка меню» выше.", .en: "Unavailable right now: the Keyboop icon is hidden from the menu bar, so there is nothing to click. Bring back the icon or the language badge in «Menu bar» above."],
         "quick.pauseLen": [.ru: "Как долго не мешать", .en: "For how long"],
-        "quick.paused":   [.ru: "Не мешаю. Вернуть правым кликом", .en: "Not disturbing you. Right click to bring me back"],
+        "quick.paused":   [.ru: "Не мешаю. Повторите быстрое действие, чтобы вернуть", .en: "Not disturbing you. Repeat the quick action to resume"],
         "quick.resumed":  [.ru: "Снова на посту", .en: "Back on duty"],
         "menu.pausedUntil":[.ru: "Не мешаю до %@", .en: "Not disturbing you until %@"],
         "menu.resumeNow": [.ru: "Продолжить сейчас", .en: "Resume now"],
@@ -190,6 +226,31 @@ enum L10n {
                                .en: "Each dictation in the history keeps its original audio"],
         "voice.saveAudioHelp":[.ru: "Иногда распознанного текста мало и хочется переслушать, как было сказано. Запись шифруется тем же ключом, что и текст истории, никуда не отправляется и живёт ровно столько же, сколько сама запись в истории: удалили запись или вышел срок хранения — исчезает и звук. Минута речи занимает около 240 КБ.",
                                .en: "Sometimes the transcript is not enough and you want to hear how it was actually said. The recording is encrypted with the same key as the history text, never leaves the Mac, and lives exactly as long as its history entry: delete the entry or let the retention expire and the audio goes with it. A minute of speech takes about 240 KB."],
+        // Вставка последней диктовки по сочетанию (задача 242, отзыв #245).
+        "voice.pasteLast":    [.ru: "Вставлять последнюю диктовку по сочетанию",
+                               .en: "Insert the last dictation by shortcut"],
+        "voice.pasteLastSub": [.ru: "Ставит её текст туда, где сейчас курсор — если он уехал не в то поле",
+                               .en: "Puts its text where the caret is now — for when it ended up in the wrong field"],
+        "voice.pasteLastHelp":[.ru: "Бывает, что диктовка закончилась, а курсор к этому моменту оказался в другом окне: текст ушёл не туда, и набирать заново обидно. Сочетание вставляет текст последней диктовки в то поле, где курсор стоит сейчас, тем же способом, что и обычная замена слова: печатью, буфер обмена не трогаем. Нужна включённая история диктовок — именно из неё берётся последняя запись, и срок хранения действует тот же. Если на историю поставлен пароль, сочетание не сработает: запрос пароля забрал бы фокус у поля, в которое вы целитесь, поэтому текст в этом случае берут из окна истории. По умолчанию сочетание не назначено.",
+                               .en: "Sometimes a dictation ends when the caret has already moved to another window: the text lands in the wrong place and retyping it is galling. The shortcut inserts the last dictation's text wherever the caret is now, the same way an ordinary word replacement works — by typing, without touching the clipboard. It needs the dictation history switched on: that is where the last entry comes from, and the same retention applies. If the history is password-protected the shortcut stays silent: the password prompt would take focus away from the very field you are aiming at, so in that case take the text from the history window. No shortcut is assigned by default."],
+        "voice.pasteLastAssign": [.ru: "Сочетание", .en: "Shortcut"],
+        "voice.pasteLastLocked": [.ru: "История под паролем — откройте окно истории",
+                                  .en: "The history is locked — open the history window"],
+        "voice.pasteLastNoHistory": [.ru: "Включите историю диктовок, иначе вставлять нечего",
+                                     .en: "Switch on the dictation history, otherwise there is nothing to insert"],
+        // ⚠️ Формулировка обязана быть верной ПРИ ОБОИХ раскладах: признак «диктовка была, но
+        // просрочена» доживает до проверки не всегда (`prune` чистит кэш и на старте, и при записи
+        // новой). Поэтому здесь не «диктовок не было», а «её нет» — правда и там, и там.
+        "voice.pasteLastNever":  [.ru: "Нечего вставлять: последней диктовки нет",
+                                  .en: "Nothing to insert: there is no last dictation"],
+        "voice.pasteLastBusy":   [.ru: "Идёт диктовка — дождитесь её текста",
+                                  .en: "A dictation is in progress — wait for its text"],
+        "voice.pasteLastOurWindow": [.ru: "Курсор в окне Keyboop — встаньте в нужное поле",
+                                     .en: "The caret is in a Keyboop window — click into the field you want"],
+        // Причин у отказа две — поле пароля и молчание Accessibility, — а `canWrite` отдаёт голый
+        // Bool и их не различает. Значит и говорить надо то, что верно в обоих случаях.
+        "voice.pasteLastSecure": [.ru: "macOS сейчас не даёт печатать в это поле",
+                                  .en: "macOS won't let us type into this field right now"],
         "voice.audioSize":    [.ru: "Записи занимают %@", .en: "Recordings take %@"],
         "voice.audioClear":   [.ru: "Удалить все записи", .en: "Delete all recordings"],
         // Плеер клипа в карточке истории.
@@ -241,7 +302,7 @@ enum L10n {
         "switch.dev":     [.ru: "Режим для разработчиков", .en: "Mode for developers"],
         "switch.devSub":  [.ru: "Бережёт код: одиночные буквы и короткие сочетания (переменные, команды) не трогаем нигде. В IDE и терминалах авто выключено целиком.",
                            .en: "Protects code: single letters and short combos (variables, commands) are left alone everywhere. In IDEs and terminals auto-switch is fully off."],
-        "switch.manual":  [.ru: "Ручное переключение", .en: "Manual switch"],
+        "switch.manual":  [.ru: "Ручное переключение и отмена", .en: "Manual switch and undo"],
         // ⚠️ ПОДПИСЬ И «i» ДОБАВЛЕНЫ 04.08.2026, ПОТОМУ ЧТО СТРОКА МОЛЧАЛА. У неё был только
         // заголовок и поле с комбинацией, то есть человек видел ЧТО назначено, но не ЗАЧЕМ. Двое
         // написали автору, что не разобрались, как переключить слово руками и как отменить автозамену.
@@ -249,8 +310,8 @@ enum L10n {
         // Коротко до предела: справа стоит поле с комбинацией, оно шире тумблера, и места под подпись
         // остаётся мало. Строки в настройках не переносятся принципиально (иначе едет вся сетка),
         // поэтому подпись обязана влезать целиком, а подробности живут в «i».
-        "switch.manualSub":  [.ru: "Переключить последнее слово, ею же отменить",
-                              .en: "Flip the last word, or undo with the same combo"],
+        "switch.manualSub":  [.ru: "Переключить последнее слово или отменить автозамену",
+                             .en: "Switch the last word, or undo an automatic switch"],
         "switch.hkPrefix":[.ru: "Хоткей:  ", .en: "Hotkey:  "],
         "switch.hkRecord":[.ru: "Нажми комбинацию…  (Esc — отмена)", .en: "Press a combo…  (Esc to cancel)"],
         "hk.custom":      [.ru: "Свой…", .en: "Custom…"],
@@ -285,7 +346,75 @@ enum L10n {
         // Зачин выбран КОРОТКИМ намеренно: длина зачина и место под имя это одна величина, и при
         // «где-то открыто поле пароля: » имени оставалось бы четыре символа. Обрезка имени по
         // ширине живёт в AppHealth.problem(rowWidth:).
-        "health.secureInput":     [.ru: "Скрытый ввод в другой программе", .en: "Hidden input in another app"],
+        "health.secureInput":     [.ru: "Клавиатуру скрыла другая программа", .en: "Another app hid the keyboard"],
+        // ⚠️ ТЕКСТ ОПИРАЕТСЯ НА ЗАМЕР, А НЕ НА ОЩУЩЕНИЕ (26.08.2026). По 120 диагностикам чужой
+        // держатель встретился в 25 отчётах у 21 человека, и две трети это браузеры: Chrome 9,
+        // Safari 6, Yandex 2. Дальше по одному-двум: 1Password, Viscosity, Slack, Почта, Telegram,
+        // терминалы. Поэтому в подсказке названы именно браузеры, а не «какая-то программа вообще».
+        // Версия macOS ни при чём: доля ровная 14–29% от 14.8 до 27.0.
+        //
+        // ⚠️ ENPASS НАЗВАН ПО ИМЕНИ, И ЭТО НЕ ОБВИНЕНИЕ (26.09.2026). Enpass 6.12.6 (вышел 14.09.2026)
+        // держит защищённый ввод ВСЁ ВРЕМЯ, пока его хранилище заблокировано, в том числе после
+        // автоблокировки в фоне: у автора ветки на форуме Enpass (тема 32258) флаг висел 9 часов.
+        // Отпускает только разблокировка или выход из Enpass, а единственный наш совет «заблокируйте
+        // и разблокируйте экран» ему не помогает вовсе. С этим и пришёл человек из Telegram:
+        // переключение пропало после обновления до macOS 27, а причиной оказался Enpass 6.12.6.
+        // Это ПРИМЕР в статичном тексте, а не держатель из ioreg: того по-прежнему не называем
+        // (см. абзац «Почему мы не называем виновника»).
+        // Совет про экран остаётся одним из вариантов, последним: браузеру и прочим он помогает.
+        "health.secureInputWho": [
+            .ru: """
+                 Что происходит. Какая-то программа включила защищённый ввод macOS. Пока он включён, \
+                 система прячет нажатия клавиш ото ВСЕХ программ сразу, не только от Keyboop. \
+                 Переключение раскладки в это время не работает ни у кого и починить это изнутри нельзя.
+
+                 Кто это обычно. Чаще всего браузер, в котором осталось в фокусе поле пароля: по нашим \
+                 отчётам две трети случаев это Chrome, Safari и Яндекс. Так же умеют менеджеры \
+                 паролей, например Enpass и 1Password, а Enpass с версии 6.12.6 держит защиту всё \
+                 время, пока его хранилище заблокировано. Реже это VPN-клиенты, мессенджеры и \
+                 терминалы с включённым «Secure Keyboard Entry». Ещё это всегда включается на \
+                 заблокированном экране, и вот это нормально.
+
+                 Почему мы не называем виновника. macOS сообщает имя держателя ненадёжно: оно \
+                 застревает на первом, кто включил защиту за сеанс. Мы проверяли, и там регулярно \
+                 оказывается посторонняя программа. Обвинять невиновного хуже, чем промолчать.
+
+                 Что делать. Обычно отпускает само. Если нет: закройте окно или вкладку, где вы \
+                 вводили пароль. Если запущен менеджер паролей, разблокируйте его или закройте \
+                 совсем. В терминале выключите «Secure Keyboard Entry» в меню программы. А если не \
+                 помогло ничего из этого, заблокируйте и разблокируйте экран.
+
+                 Что работает прямо сейчас. Диктовка: ей клавиатура не нужна, она пишет текст сама.
+                 """,
+            .en: """
+                 What is happening. Some app has turned on macOS secure keyboard entry. While it is on, \
+                 the system hides keystrokes from EVERY app at once, not just from Keyboop. Layout \
+                 switching cannot work for anyone during that time, and no app can fix it from inside.
+
+                 Who usually does it. Most often a browser with a password field left focused: in our \
+                 reports two thirds of cases are Chrome, Safari and Yandex. Password managers do it \
+                 too, for example Enpass and 1Password, and Enpass since version 6.12.6 keeps it on \
+                 the whole time its vault is locked. Less often VPN clients, messengers, and terminals \
+                 with Secure Keyboard Entry on. It also always turns on while the screen is locked, \
+                 and that part is normal.
+
+                 Why we do not name the culprit. macOS reports the holder unreliably: the name sticks to \
+                 whoever turned the protection on first in the session. We measured it, and it regularly \
+                 points at an app that has nothing to do with it. Accusing the innocent is worse than \
+                 saying nothing.
+
+                 What to do. It usually clears by itself. If it does not: close the window or tab where \
+                 you typed a password. If a password manager is running, unlock it or quit it. In a \
+                 terminal, turn off Secure Keyboard Entry in the app menu. And if none of that helps, \
+                 lock and unlock the screen.
+
+                 What still works. Dictation: it does not need the keyboard, it types the text itself.
+                 """],
+        // Подсказка значка. Совет про менеджер паролей стоит здесь тоже (26.09.2026): до «Приватности»
+        // доходят не все, а у Enpass 6.12.6 блокировка экрана, единственный совет прежнего текста,
+        // не помогает. Длинное тире из русского текста убрано заодно.
+        "health.secureInputTip":  [.ru: "Какая-то программа включила защищённый ввод macOS, и клавиши скрыты системно: от нас и от любой другой программы. Переключение раскладки сейчас не работает, диктовка работает. Обычно отпускает само. Если нет, закройте вкладку с полем пароля. Менеджер паролей разблокируйте или закройте: Enpass с версии 6.12.6 держит защиту, пока его хранилище заблокировано. Ещё помогает заблокировать и разблокировать экран.",
+                                   .en: "Some app turned on macOS secure keyboard entry, so keystrokes are hidden system-wide, from us and from every other app. Layout switching is off for now, dictation still works. It usually clears by itself. If it doesn't, close the tab with the password field. Unlock or quit your password manager: Enpass since 6.12.6 keeps it on while its vault is locked. Locking and unlocking the screen also helps."],
         "health.secureInputHolder": [.ru: "Скрытый ввод: %@", .en: "Hidden input: %@"],
         // Подсказки значка (P3.4). Эти две ЦЕЛЫЕ фразы, а не фрагменты общего ряда, потому что
         // висят сами по себе при наведении. Про паузу отдельной строки нет намеренно: её текст
@@ -333,6 +462,7 @@ enum L10n {
         "hkrec.what.switch": [.ru: "исправление раскладки по хоткею", .en: "fix layout by hotkey"],
         "hkrec.what.voice":  [.ru: "голосовой набор", .en: "dictation"],
         "hkrec.what.translate": [.ru: "перевод выделенного", .en: "translate selection"],
+        "hkrec.what.pasteLast": [.ru: "вставка последней диктовки", .en: "insert the last dictation"],
         "hkrec.what.instant":[.ru: "мгновенная смена языка", .en: "instant language switch"],
 
         // — 0.2.20: строки, ранее захардкоженные мимо L10n (ревизия локализации) —
@@ -380,6 +510,8 @@ enum L10n {
         "ret.2h":         [.ru: "2 часа",   .en: "2 hours"],
         "ret.4h":         [.ru: "4 часа",   .en: "4 hours"],
         "ret.8h":         [.ru: "8 часов",  .en: "8 hours"],
+        "ret.7d":         [.ru: "7 дней",   .en: "7 days"],
+        "ret.30d":        [.ru: "30 дней",  .en: "30 days"],
         "ret.never":      [.ru: "Не удалять", .en: "Keep all"],
         // Описания моделей Whisper (ModelDownloader.catalog хранит ключи)
         // ⚠️ ЧЕТЫРЕ ЧИСЛА НА КАЖДУЮ МОДЕЛЬ (задача автора 04.08.2026, повод — жалоба на память).
@@ -506,8 +638,10 @@ enum L10n {
         // Обещание, сказанное двумя разными числами в двух местах, перестаёт быть обещанием.
         "priv.body2":     [.ru: "В сеть Keyboop выходит по четырём поводам, и три из них начинаешь ты: скачать языковую модель, открыть сайт или телеграм из меню, отправить отзыв (уходит ровно то, что видно в окне отправки). Четвёртый — проверка обновлений: она шлёт только твой IP и номер версии, как любой заход на сайт. Ни буквы из набранного или надиктованного. Всё выключается в Настройках → Обновления.",
                            .en: "Keyboop goes online for four reasons, and you start three of them: downloading a voice model, opening the site or Telegram from the menu, sending feedback (only what you see in the send window goes out). The fourth is the update check: it sends your IP and version number, the same as visiting any website. Not a letter of what you typed or dictated. All of it can be turned off in Settings → Updates."],
-        "priv.guard":     [.ru: "Пока мгновенное переключение висит на 🌐, рядом работает второй процесс с тем же именем — он сторожит одну-единственную вещь. Чтобы клавиша переключала язык, её системное действие приходится отключить, и вернуть его обязаны мы. Если Keyboop завершится аварийно, сделать это сам он уже не сможет, поэтому за него это делает сторож: он ждёт, возвращает клавишу и уходит. В сеть не ходит, ввод не читает, вашего в нём нет ничего.",
-                           .en: "While instant switching is bound to 🌐, a second process with the same name runs alongside — it guards exactly one thing. For the key to switch languages, its system action has to be turned off, and restoring it is on us. If Keyboop exits abnormally it can no longer do that itself, so the guard does it instead: it waits, restores the key and leaves. It never goes online, never reads your input, and holds nothing of yours."],
+        "priv.guard":     [.ru: "Вместе с Keyboop всю его сессию работает второй спящий процесс с тем же именем. Это общий сторож системных состояний: он возвращает действие клавиши 🌐 и выключает датчик жеста, если основная программа завершится аварийно. Пока функции не используются, он ничего не включает и просто ждёт. В сеть не ходит, ввод и движения не записывает, вашего в нём нет ничего.",
+                           .en: "A second sleeping process with the same name runs for the whole Keyboop session. It guards system state: it restores the 🌐 key action and turns off the gesture sensor if the main app exits abnormally. When those features are unused it enables nothing and simply waits. It never goes online and records neither input nor motion."],
+        "priv.guardNoSlap":[.ru: "Вместе с Keyboop всю его сессию работает второй спящий процесс с тем же именем. Это сторож системного состояния: он возвращает действие клавиши 🌐, если основная программа завершится аварийно. Пока функция не используется, он ничего не меняет и просто ждёт. В сеть не ходит, ввод не записывает, вашего в нём нет ничего.",
+                           .en: "A second sleeping process with the same name runs for the whole Keyboop session. It guards system state by restoring the 🌐 key action if the main app exits abnormally. While that feature is unused it changes nothing and simply waits. It never goes online or records input."],
         "priv.update":    [.ru: "Обновления — на keyboop.com", .en: "Updates — at keyboop.com"],
         "priv.foot":      [.ru: "Спокойно. Всё остаётся на твоём Mac.", .en: "Calm. It all stays on your Mac."],
         "gen.title":      [.ru: "Общие", .en: "General"],
@@ -565,6 +699,7 @@ enum L10n {
         "is.busy.snippet":[.ru: "список сниппетов", .en: "the snippet picker"],
         "is.busy.paste":  [.ru: "вставка без форматирования", .en: "paste without formatting"],
         "is.busy.case":   [.ru: "смена регистра", .en: "changing the case"],
+        "is.busy.pasteLast":[.ru: "вставка последней диктовки", .en: "inserting the last dictation"],
         "is.busy.snippetNoFree":[.ru: "все готовые сочетания уже заняты другими функциями. Назначьте своё через «Назначить свою…».",
                                  .en: "every ready-made shortcut is already taken by another function. Set your own via «Set your own…»."],
         "is.noShift":     [.ru: "Shift не подойдёт: он нажимается перед каждой заглавной буквой, и язык начнёт переключаться сам собой. Выберите другую клавишу.",
@@ -894,10 +1029,10 @@ enum L10n {
         "voice.outputGroupNote": [.ru: "Эти правила применяются к уже распознанному тексту, поэтому работают одинаково на любой модели.",
                                   .en: "These rules apply to the finished text, so they work the same on every model."],
         "voice.noCapital":[.ru: "Не начинать с заглавной", .en: "No leading capital"],
-        "voice.noCapitalSub": [.ru: "Со строчной начинается каждое предложение, а не только первое. Аббревиатуры вроде «МФЦ» не трогаем",
-                               .en: "Every sentence starts lowercase, not just the first one. Acronyms like «NASA» are left alone"],
-        "voice.noCapitalHelp": [.ru: "Заглавная снимается у первой буквы КАЖДОГО предложения: и в самом начале, и после каждой точки, вопросительного и восклицательного знака. До 0.3.20 правило доставало только первую букву всей диктовки, а остальные предложения оставались с заглавной. Аббревиатуры не трогаем: если следом за первой буквой идёт ещё одна заглавная, слово остаётся как есть, иначе «МФЦ» превратилось бы в «мФЦ». Сокращения с точкой («г.», «ул.», «т. д.») концом предложения не считаются, поэтому «г. Москва» остаётся Москвой.",
-                                .en: "The capital is removed from the first letter of EVERY sentence: at the very start and after every full stop, question mark and exclamation mark. Until 0.3.20 the rule only reached the first letter of the whole dictation and later sentences kept their capitals. Acronyms are left alone: if the second letter is also a capital the word stays as it is, otherwise «NASA» would become «nASA». Abbreviations that end in a period («Mr.», «Dr.», «e.g.») do not count as the end of a sentence."],
+        "voice.noCapitalSub": [.ru: "Каждое предложение — со строчной; имена вроде «Иван» и «Мария» и аббревиатуры сохраняют заглавную",
+                               .en: "Every sentence starts lowercase; common Russian names and acronyms keep their capitals"],
+        "voice.noCapitalHelp": [.ru: "Заглавная снимается у первой буквы каждого предложения: в самом начале, после точки, вопросительного и восклицательного знака. Частые русские имена, их обычные краткие и падежные формы остаются с заглавной. В неоднозначных случаях имя важнее нарицательного: «Роман», «Вера» и «Лев» считаются именами. Редкое неизвестное имя не угадываем, но если слово уже встретилось с заглавной внутри предложения, такое же написание дальше сохраняется. Аббревиатуры и слова с заданным регистром из словаря диктовки тоже не трогаем. Сокращения с точкой («г.», «ул.», «т. д.») концом предложения не считаются, поэтому «г. Москва» остаётся Москвой.",
+                                .en: "The first letter of every sentence is lowercased: at the beginning and after full stops, question marks, and exclamation marks. Common Russian given names and their usual short and inflected forms keep their capitals. When a word is ambiguous, the name wins: «Роман», «Вера», and «Лев» are treated as names. An unknown rare name is not guessed, but an identical spelling already seen capitalized inside the sentence is preserved later. Acronyms and words whose case is set by the dictation dictionary are also left alone. Abbreviations ending in a period («Mr.», «Dr.», «e.g.») do not start a new sentence."],
         "voice.noPeriod": [.ru: "Не ставить точку в конце", .en: "No trailing period"],
         "voice.noPeriodSub": [.ru: "Для мессенджеров и полей поиска, где точка в конце лишняя. Вопрос, восклицание и многоточие остаются",
                               .en: "For chats and search fields where a final period is noise. Question marks, exclamations and ellipses stay"],
@@ -952,7 +1087,7 @@ enum L10n {
         "voice.log":      [.ru: "Системный лог", .en: "System log"],
         "voice.logHint":  [.ru: "Если диктовка вдруг не сработала — открой лог (локальный, без текста распознавания) и пришли его на hi@keyboop.com.",
                            .en: "If dictation ever misfires — open the log (local, without recognized text) and send it to hi@keyboop.com."],
-        "voice.securePwd": [.ru: "Поле пароля — печатать не буду. Текст сохранён в истории.",
+        "voice.securePwd": [.ru: "Сюда печатать не буду. Текст сохранён в истории.",
                             .en: "Password field — won't type here. Your text is saved to history."],
         "voice.deadBundle": [.ru: "Файлы Keyboop изменились на диске — перезапусти приложение, и микрофон вернётся.",
                              .en: "Keyboop's files changed on disk — relaunch the app to get the mic back."],
@@ -1030,9 +1165,9 @@ enum L10n {
         "switch.chatterHelp": [.ru: "У изношенных клавиатур контакт иногда срабатывает дважды с одного нажатия, и в тексте появляется лишняя буква. Мы отбрасываем повтор той же клавиши, если он пришёл быстрее чем через 30 миллисекунд. Настоящие двойные буквы это не задевает: даже у быстрых машинисток на «сс» в «ссоре» уходит вдвое больше. Зажатую клавишу тоже не трогаем, автоповтор работает как обычно. Сочетания с ⌘, ⌃ и ⌥ проходят мимо фильтра целиком: пропущенная команда заметна сильнее, чем лишняя. Выключено по умолчанию, потому что это перехват ввода, а не исправление текста.",
                                .en: "On worn keyboards a contact sometimes fires twice from a single press, and an extra letter shows up. We drop a repeat of the same key if it arrives sooner than 30 milliseconds. Genuine double letters are untouched: even fast typists need twice that for the pair in “class”. Holding a key is unaffected too, autorepeat works as usual. Shortcuts with ⌘, ⌃ or ⌥ bypass the filter entirely: a command that never fired hurts more than one that fired twice. Off by default, because this intercepts your typing rather than correcting text."],
         "switch.typoFix":    [.ru: "Исправлять опечатки", .en: "Fix typos"],
-        "switch.typoFixSub": [.ru: "«тедефон» превращается в «телефон», а «пРИВЕТ» в «Привет»", .en: "“tlephone” becomes “telephone”, and “hELLO” becomes “Hello”"],
-        "switch.typoFixHelp":[.ru: "Исправляются два случая: частая опечатка из проверенного списка («извените» → «извините») и промах по соседней клавише или перестановка двух букв («тедефон» → «телефон»). Слово меняется, только если словарное слово получилось ровно одно; если подходящих несколько, мы не гадаем и не трогаем ничего. Выключено по умолчанию, потому что это правка самого текста, а не раскладки. ⚠️ Профессиональное слово, которого нет в словаре, программа тоже может исправить. Верните его как было, и она это запомнит. Ваши исключения и выученные слова не трогаются вовсе. Сюда же попадает след Caps Lock: слово, у которого первая буква строчная, а все остальные заглавные («пРИВЕТ»), разворачивается обратно в «Привет».",
-                              .en: "Two cases get corrected: a common typo from a vetted list (“recieve” → “receive”), and a slip onto a neighbouring key or two letters swapped (“tlephone” → “telephone”). A word changes only when exactly one dictionary word fits; when several do, we do not guess and change nothing. Off by default, because this edits the text itself rather than the layout. ⚠️ A professional word missing from the dictionary can be corrected too. Put it back the way you had it and the app remembers. Your exceptions and learned words are never touched. The Caps Lock signature belongs here too: a word whose first letter is lower case and all the rest upper case (“hELLO”) is turned back into “Hello”."],
+        "switch.typoFixSub": [.ru: "«тедефон» → «телефон», «1ю8» → «1.8»", .en: "“tlephone” → “telephone”, “1ю8” → “1.8”"],
+        "switch.typoFixHelp":[.ru: "Исправляются очевидные механические ошибки: частая опечатка из проверенного списка («извените» → «извините»), переставленные соседние или случайно удвоенные буквы («тедефон» → «телефон») и русская «ю» между цифрами вместо точки («1ю8» → «1.8»). Для словарной догадки слово меняется, только если правильный вариант получился ровно один; если подходящих несколько, мы не гадаем. Выключено по умолчанию, потому что это правка самого текста, а не раскладки. ⚠️ Профессиональное слово, которого нет в словаре, программа тоже может исправить. Верните его как было, и она это запомнит. Ваши исключения и выученные слова не трогаются вовсе. Сюда же попадает след Caps Lock: слово, у которого первая буква строчная, а все остальные заглавные («пРИВЕТ»), разворачивается обратно в «Привет».",
+                              .en: "Obvious mechanical mistakes are corrected: a common typo from a vetted list (“recieve” → “receive”), neighbouring letters swapped or accidentally doubled (“tlephone” → “telephone”), and the Russian-layout letter “ю” between digits in place of a dot (“1ю8” → “1.8”). For dictionary-based guesses, a word changes only when exactly one correction fits; when several do, we do not guess. Off by default, because this edits the text itself rather than the layout. ⚠️ A professional word missing from the dictionary can be corrected too. Put it back the way you had it and the app remembers. Your exceptions and learned words are never touched. The Caps Lock signature belongs here too: a word whose first letter is lower case and all the rest upper case (“hELLO”) is turned back into “Hello”."],
         "switch.twoCaps":    [.ru: "Две заглавные подряд", .en: "Two leading capitals"],
         "switch.twoCapsSub": [.ru: "«КОгда» превращается в «Когда»", .en: "“WHen” becomes “When”"],
         "switch.twoCapsHelp": [.ru: "Так выходит, когда Shift отпущен на миг позже, чем нажата вторая буква. Keyboop чинит только этот случай: ровно две первые буквы заглавные, третья строчная, и в слове одни буквы. Слова целиком заглавными, вроде ГОСТ или USB, а также короткие «ДА» и «ОК» не трогаются. Выключено по умолчанию, потому что это правка самого текста, а не раскладки.",
@@ -1041,8 +1176,8 @@ enum L10n {
         // обучение на отмене, и почему не помогает стереть слово и набрать заново. Всё это правда, но
         // подсказка у строки отвечает на один вопрос — что делает ЭТА комбинация. Длинный текст в
         // маленьком поповере путает ровно того, кто уже не разобрался, а именно ради него он и писан.
-        "switch.manualHelp": [.ru: "Переключает последнее набранное слово в другую раскладку, ждать пробела не нужно. Если Keyboop переключил слово сам и зря, эта же комбинация вернёт его как было. А когда ничего не набрано, просто меняется язык, как обычным переключателем раскладки.",
-                              .en: "Flips the last word you typed into the other layout, no need to wait for a space. If Keyboop flipped a word by itself and got it wrong, the same combo puts it back. And when nothing is typed, it simply switches the language, like the system layout switcher."],
+        "switch.manualHelp": [.ru: "Переключает последнее набранное слово в другую раскладку, ждать пробела не нужно. ЭТИМ ЖЕ СОЧЕТАНИЕМ ОТМЕНЯЕТСЯ АВТОМАТИЧЕСКОЕ ПЕРЕКЛЮЧЕНИЕ: если Keyboop переключил слово сам, а вы этого не хотели, нажмите его, и слово вернётся как было. Именно поэтому в названии строки стоит «и отмена»: люди не догадывались, что отменять нужно тем же сочетанием, а не искать отдельное.",
+                             .en: "Switches the last typed word to the other layout, no need to wait for a space. THE SAME SHORTCUT UNDOES AN AUTOMATIC SWITCH: if Keyboop switched a word by itself and you did not want that, press it and the word comes back."],
         "switch.arrowsHelp": [.ru: "Речь о четырёх клавишах курсора. Пока вы печатаете слово, Keyboop держит его в памяти, чтобы починить. Стрелка означает, что курсор уехал и слово, скорее всего, уже не то — поэтому память сбрасывается. Выключите, если часто двигаете курсор посреди слова и хотите, чтобы починка всё равно сработала.\n\nВажная мелочь, о которой не говорит ни заголовок, ни подпись: вместе с памятью пропадает цель и у ручного сочетания. Нажали стрелку, потом ⌥⇧ — язык сменится, но слово уже не починится, потому что чинить нечего.",
                               .en: "This is about the four cursor keys. While you type a word, Keyboop keeps it in memory so it can fix it. An arrow means the caret moved and the word is probably no longer the one you meant, so the memory is dropped. Turn this off if you often move the caret mid-word and still want the fix.\n\nOne detail neither the title nor the subtitle mentions: the manual shortcut loses its target too. Press an arrow, then ⌥⇧, and the language will switch but the word will not be fixed — there is nothing left to fix."],
         "hist.lockHelp":  [.ru: "Окно истории будет спрашивать пароль при каждом открытии. Сам пароль хранится в связке ключей macOS, а записи шифруются — мы их не видим и восстановить не сможем. Защита от того, кто сядет за ваш незаблокированный Mac, а не от кражи диска.",
@@ -1078,17 +1213,101 @@ enum L10n {
                            .en: "New versions can be reviewed on GitHub and then built manually. The app never replaces itself."],
         "voice.history":  [.ru: "Хранить историю", .en: "Keep history"],
         "voice.historySub":[.ru: "Зашифровано, остаётся на этом Mac", .en: "Encrypted, stays on this Mac"],
+        // Захват буфера обмена в ту же историю (задача 228). Выключен по умолчанию. Тумблер живёт
+        // в «Общих» (решение автора 04.09.2026: в голосовом наборе ему не место), остальные настройки
+        // истории остаются в голосовом наборе, и подсказка под тумблером говорит, где их искать.
+        "gen.history":         [.ru: "История", .en: "History"],
+        "gen.clipHistory":     [.ru: "Запоминать скопированный текст", .en: "Remember copied text"],
+        "gen.clipHistorySub":  [.ru: "Выключено по умолчанию. Только текст, зашифровано, остаётся на этом Mac",
+                                .en: "Off by default. Text only, encrypted, stays on this Mac"],
+        "gen.clipHistoryNeedsHistory":[.ru: "Сначала включите «Хранить историю» в разделе «Голосовой набор»",
+                                       .en: "Turn on “Keep history” in the “Voice input” section first"],
+        "gen.clipHistoryHelp": [.ru: "Всё, что вы копируете как текст, попадает в общую историю рядом с диктовками, и поиск ищет по обоим сразу. Не записывается: пока где-то открыто поле пароля, то, что менеджеры паролей помечают как секрет, а также файлы, картинки и форматирование. Собственные служебные операции Keyboop с буфером в историю не попадают. Срок хранения, пароль на историю и очистка общие.",
+                                .en: "Everything you copy as text lands in the shared history next to dictations, and search covers both at once. Not recorded: anything while a password field is open somewhere, entries password managers mark as secret, plus files, images and formatting. Keyboop's own clipboard housekeeping never lands here. Retention, the history password and clearing are shared."],
+        "gen.historyHint":     [.ru: "Скопированный текст попадает в ту же историю, что и диктовки: меню значка → «История диктовки и буфера…». Срок хранения, пароль на историю и запись голоса настраиваются в разделе «Голосовой набор» → «История».",
+                                .en: "Copied text lands in the same history as dictations: menu icon → “Dictation and clipboard history…”. Retention, the history password and audio recording are set in “Voice input” → “History”."],
+        // Сокращение срока хранения (ревью 24.09.2026): без вопроса промах мышью стирал историю.
+        "voice.retShrink.title":  [.ru: "Записей старше нового срока: %d", .en: "Entries older than the new period: %d"],
+        "voice.retShrink.msg":    [.ru: "Они удалятся сразу вместе с записью голоса, и вернуть их будет нельзя. Расшифровки файлов останутся.",
+                                   .en: "They will be deleted right away together with their voice recordings and cannot be brought back. Transcribed files stay."],
+        "voice.retShrink.keep":   [.ru: "Оставить как было", .en: "Keep as it was"],
+        "voice.retShrink.delete": [.ru: "Удалить и сократить срок", .en: "Delete and shorten"],
+        "gen.clipOff.title":   [.ru: "Записей буфера в истории: %d", .en: "Clipboard entries in history: %d"],
+        "gen.clipOff.msg":     [.ru: "Новые записи больше не сохраняются. Уже сохранённые можно оставить или удалить сейчас. Диктовки останутся в любом случае.",
+                                .en: "New entries are no longer saved. The ones already saved can stay or be deleted now. Dictations stay either way."],
+        "gen.clipOff.keep":    [.ru: "Оставить", .en: "Keep"],
+        "gen.clipOff.delete":  [.ru: "Удалить записи буфера", .en: "Delete clipboard entries"],
         "voice.histClear":[.ru: "Очистить историю", .en: "Clear history"],
         "voice.showHistory":[.ru: "Показать историю…", .en: "Show history…"],
-        "hist.title":     [.ru: "История голосового набора", .en: "Dictation history"],
+        // «История диктовки и буфера»: с 04.09.2026 в ленте и буфер (задача 228), имя выбрал автор.
+        "hist.title":     [.ru: "История диктовки и буфера", .en: "Dictation and clipboard history"],
+        "hist.kind.dictation":    [.ru: "Диктовка", .en: "Dictation"],
+        "hist.kind.clipboard":    [.ru: "Буфер", .en: "Clipboard"],
+        "hist.kind.clipboardFrom":[.ru: "Буфер · %@", .en: "Clipboard · %@"],
+        // Импорт аудиофайла (задача 229).
+        "hist.kind.file":     [.ru: "Файл · %@", .en: "File · %@"],
+        "hist.import":        [.ru: "Импортировать аудио…", .en: "Import audio…"],
+        "hist.importTitle":   [.ru: "Выберите аудио- или видеофайл. Расшифровка идёт на этом Mac и займёт время: у часовой записи это минуты. Результат ляжет в историю и не удалится по сроку хранения, только вручную.",
+                               .en: "Choose an audio or video file. Transcription runs on this Mac and takes a while: an hour-long recording means minutes. The result lands in History and is not removed by retention, only by hand."],
+        "hist.importProgress":[.ru: "Расшифровываю «%@»: %@ из %@", .en: "Transcribing “%@”: %@ of %@"],
+        "hist.importEta":     [.ru: "осталось около %@", .en: "about %@ left"],
+        "hist.importCancel":  [.ru: "Отменить", .en: "Cancel"],
+        "hist.importDone":    [.ru: "Файл расшифрован и добавлен в историю", .en: "The file is transcribed and added to History"],
+        "hist.importPartial": [.ru: "Импорт остановлен, расшифрованная часть сохранена", .en: "Import stopped, the transcribed part is saved"],
+        "hist.importCancelled":[.ru: "Импорт отменён", .en: "Import cancelled"],
+        "hist.importEmpty":   [.ru: "В файле не нашлось речи", .en: "No speech found in the file"],
+        "hist.importFailed":  [.ru: "Не удалось прочитать файл", .en: "The file could not be read"],
+        "hist.importEngineFailed":[.ru: "Движок распознавания не ответил, импорт остановлен", .en: "The recognition engine did not respond, import stopped"],
+        "hist.importBusy":    [.ru: "Импорт уже идёт", .en: "An import is already running"],
+        "hist.importNoHistory":[.ru: "Включите «Хранить историю», чтобы было куда положить расшифровку", .en: "Turn on “Keep history” so the transcript has somewhere to go"],
+        "hist.saveText":      [.ru: "Сохранить текст…", .en: "Save text…"],
+        "hist.saveTextDoneFolder":[.ru: "Текст сохранён в папке «%@»", .en: "Text saved in the “%@” folder"],
+        "hist.saveTextFailed":[.ru: "Не удалось сохранить текст", .en: "The text could not be saved"],
+        "hist.expand":        [.ru: "Показать целиком (%@ симв.)", .en: "Show all (%@ chars)"],
+        "hist.collapse":      [.ru: "Свернуть", .en: "Collapse"],
+        "hist.more":          [.ru: "Показать ещё %@ из %@", .en: "Show %@ more of %@"],
+        /// Подпись на значке в Dock, пока открыто окно истории.
+        "dock.history":       [.ru: "История", .en: "History"],
+        // Запись звука с Mac (задача 230, скрытая: ⌥-клик по значку). В интерфейсе это «запись», не
+        // «звонок» (автор 05.09): пишут и созвоны, и выпуски YouTube, и что угодно.
+        "hist.kind.call":     [.ru: "Запись · %@", .en: "Recording · %@"],
+        "call.tip":           [.ru: "Идёт запись звука. ⌥-клик по значку остановит", .en: "Audio recording in progress. ⌥-click the icon to stop"],
+        "call.started":       [.ru: "Запись началась. Остановить: ⌥-клик по значку", .en: "Recording started. To stop: ⌥-click the icon"],
+        "call.saved":         [.ru: "Запись расшифрована и добавлена в историю", .en: "The recording is transcribed and added to History"],
+        "call.savedAfterStall":[.ru: "Запись прервалась, но записанное расшифровано и в истории", .en: "Recording was interrupted, but what was recorded is transcribed and in History"],
+        "call.empty":         [.ru: "В записи не нашлось речи, ничего не сохранено", .en: "No speech in the recording, nothing saved"],
+        "call.noSystemAudioTitle": [.ru: "Записан только микрофон", .en: "Only the microphone was recorded"],
+        "call.noSystemAudioBody":  [.ru: "Ваш голос слышно, а звук от собеседников не пришёл: скорее всего, macOS не дала нам его записывать. Это отдельное разрешение, оно не то же самое, что микрофон. Откройте «Запись экрана и системного звука», найдите там список «Только запись системного звука» и включите в нём Keyboop.",
+                                    .en: "Your voice came through, but the other side did not: macOS most likely did not let us record it. That is a separate permission, not the same as the microphone. Open “Screen & System Audio Recording”, find the “System Audio Recording Only” list there and switch Keyboop on."],
+        "call.silenceTitle":  [.ru: "Пять минут тишины", .en: "Five minutes of silence"],
+        "call.silenceBody":   [.ru: "Звук, похоже, закончился. Остановить запись? Через две минуты остановлю сам.",
+                               .en: "The audio seems to be over. Stop recording? I will stop on my own in two minutes."],
+        "call.silenceStop":   [.ru: "Остановить", .en: "Stop"],
+        "call.silenceContinue":[.ru: "Продолжить", .en: "Keep recording"],
+        "call.stalledTitle":  [.ru: "Запись прервалась", .en: "Recording interrupted"],
+        "call.stalledBody":   [.ru: "Звук перестал приходить, и три перезапуска не помогли. Записанное сохраняю; на всякий случай включи диктофон на телефоне.",
+                               .en: "Audio stopped arriving and three restarts did not help. Saving what was recorded; start a phone recorder just in case."],
+        "call.noPermissionTitle":[.ru: "Нет разрешения записывать звук", .en: "No permission to record audio"],
+        "call.noPermissionBody":[.ru: "macOS не дала Keyboop записывать системный звук. Разреши в Системных настройках → Конфиденциальность → Запись экрана и системного звука, затем нажми ⌥-клик снова.",
+                                 .en: "macOS did not let Keyboop record system audio. Allow it in System Settings → Privacy → Screen & System Audio Recording, then ⌥-click again."],
+        "call.noPermissionOpen":[.ru: "Открыть настройки", .en: "Open Settings"],
+        "call.noSpace":       [.ru: "Мало места на диске для записи", .en: "Not enough disk space to record"],
+        "call.unavailable":   [.ru: "Запись звука требует macOS 14.2 или новее", .en: "Audio recording needs macOS 14.2 or later"],
+        "call.recovering":    [.ru: "Восстанавливаю незавершённую запись", .en: "Recovering an unfinished recording"],
         "hist.copy":      [.ru: "Скопировать", .en: "Copy"],
         "hist.hint":      [.ru: "Двойной клик по записи — скопировать.", .en: "Double-click an entry to copy."],
         "hist.search":    [.ru: "Поиск по истории", .en: "Search history"],
         "hist.empty":     [.ru: "Пока пусто. Зажми хоткей и продиктуй.", .en: "Empty so far. Hold the hotkey and dictate."],
+        "hist.emptyClip": [.ru: "Пока пусто. Продиктуй или скопируй что-нибудь.", .en: "Empty so far. Dictate or copy something."],
         "hist.pin":       [.ru: "Поверх всех окон", .en: "Keep on top"],
         "hist.translucent":[.ru: "Полупрозрачность окна", .en: "Window translucency"],
         "hist.rec":       [.ru: "Записать", .en: "Record"],
         "hist.recStop":   [.ru: "Стоп", .en: "Stop"],
+        "hist.saveAudio": [.ru: "Сохранить аудио…", .en: "Save audio…"],
+        "hist.saveAudioDone":[.ru: "Аудио сохранено", .en: "Audio saved"],
+        "hist.saveAudioDoneFolder":[.ru: "Аудио сохранено в папке «%@»", .en: "Audio saved in the “%@” folder"],
+        "hist.saveAudioFailed":[.ru: "Не удалось сохранить аудио", .en: "The audio could not be saved"],
+        "hist.showInFinder":[.ru: "Показать сохранённый файл в Finder", .en: "Show the saved file in Finder"],
         "hist.del":       [.ru: "Удалить", .en: "Delete"],
         "hist.settings":  [.ru: "Настройки голосового набора", .en: "Voice settings"],
         "hist.lock.toggle":   [.ru: "Пароль на историю", .en: "History password"],
@@ -1121,8 +1340,11 @@ enum L10n {
         // значит расставлять ожидания, которые он не собирается выполнять. Осталась честная причина.
         "fb.contactWhy":  [.ru: "Без него я прочитаю, но ответить будет некуда.",
                            .en: "Without it I'll still read this, but I'll have nowhere to reply."],
-        "fb.diag":        [.ru: "Приложить диагностику (версия, настройки, хвост лога)",
-                           .en: "Attach diagnostics (version, settings, log tail)"],
+        // ⚠️ КОРОТКО, ПОТОМУ ЧТО РЯДОМ КНОПКА. Подпись живёт в одном ряду с «показать, что уйдёт»,
+        // и длинный вариант «(версия, настройки, хвост лога)» обрезался многоточием прямо на
+        // середине слова (скриншот автора 26.08.2026). Расшифровка и так стоит строкой ниже, в
+        // `fb.hint`, целиком и без обрезки, так что в самой галочке она была лишней.
+        "fb.diag":        [.ru: "Приложить диагностику", .en: "Attach diagnostics"],
         "fb.diagShow":    [.ru: "показать, что уйдёт", .en: "see what's sent"],
         "fb.diagTitle":   [.ru: "Что уйдёт вместе с отзывом", .en: "What goes along with your feedback"],
         "fb.hint":        [.ru: "Улетает на keyboop.com и разработчику в Telegram. Текст ввода и речь в диагностику не попадают — там только версии, настройки и служебный лог.",
@@ -1152,7 +1374,20 @@ enum L10n {
                               .en: "Thank you. I'll read every word. You left no contact, so there's nowhere to reply — that doesn't affect anything else."],
         "fb.doneClose":   [.ru: "Закрыть", .en: "Close"],
         "fb.tooShort":    [.ru: "Напиши хоть пару слов )", .en: "Give me at least a couple of words )"],
-        "menu.voiceHistory":[.ru: "История голосового набора…", .en: "Dictation history…"],
+        // Вложение к отзыву (задача 191, 05.09.2026).
+        "fb.attach":      [.ru: "Прикрепить скриншот или видео…", .en: "Attach a screenshot or video…"],
+        "fb.attachHint":  [.ru: "PNG или JPEG до 10 МБ, MOV или MP4 до 25 МБ. Файл уходит разработчику в Telegram и на сервере не остаётся.",
+                           .en: "PNG or JPEG up to 10 MB, MOV or MP4 up to 25 MB. The file goes straight to the developer's Telegram and is not kept on the server."],
+        "fb.attachRemove": [.ru: "Убрать файл", .en: "Remove the file"],
+        "fb.attachTooLarge": [.ru: "Файл больше %@. Обрежьте или сожмите его.", .en: "The file is over %@. Trim or compress it."],
+        "fb.attachBadType": [.ru: "Подойдут только PNG, JPEG, MOV и MP4.", .en: "Only PNG, JPEG, MOV and MP4 will do."],
+        "fb.sendingFile": [.ru: "Текст улетел, отправляю файл…", .en: "Text is off, sending the file…"],
+        "fb.fileFail":    [.ru: "Текст улетел, а файл не дошёл.", .en: "The text made it, the file didn't."],
+        "fb.fileRetry":   [.ru: "Повторить файл", .en: "Retry the file"],
+        "fb.doneFile":    [.ru: "Файл тоже дошёл.", .en: "The file made it too."],
+        "fb.unitMB":      [.ru: "МБ", .en: "MB"],
+        "fb.unitKB":      [.ru: "КБ", .en: "KB"],
+        "menu.voiceHistory":[.ru: "История диктовки и буфера…", .en: "Dictation and clipboard history…"],
         "menu.copyLast":  [.ru: "Скопировать последнюю диктовку", .en: "Copy last dictation"],
         "voice.grpDuck":  [.ru: "Пока вы диктуете", .en: "While you dictate"],
         "voice.duck":     [.ru: "Приглушать звук на время диктовки", .en: "Turn the volume down while dictating"],
@@ -1170,13 +1405,30 @@ enum L10n {
         // Коротко: сначала что делает, потом потолок, потом шутка. Не расписывать (автор 30.07).
         "voice.duckLevelHelp": [.ru: "Во время диктовки громкость опустится до этого уровня, потом вернётся. Выше 77% не поднимается. Просто потому что.",
                                  .en: "While you dictate the volume drops to this level, then comes back. It will not go above 77%. Just because."],
+        // Выгрузка модели после каждой диктовки (автор 24.09.2026). Подпись однострочная и
+        // усекается, поэтому в ней только главное: кому НЕ нужно. Цена и механика — в «i».
+        "voice.unloadAfter":    [.ru: "Выгружать модель после каждой диктовки",
+                                 .en: "Unload the model after each dictation"],
+        "voice.unloadAfterSub": [.ru: "Не нужно, если объединённой памяти хватает",
+                                 .en: "Not needed if you have enough unified memory"],
+        // У Intel-Mac объединённой памяти нет, там это обычная оперативная (ревью 24.09).
+        "voice.unloadAfterSubIntel": [.ru: "Не нужно, если оперативной памяти хватает",
+                                      .en: "Not needed if you have enough memory"],
+        "voice.unloadAfterHelp":[.ru: "Для Mac с небольшой памятью, например 8 ГБ. Модель распознавания занимает от полутора сотен мегабайт до 1,6 ГБ и обычно остаётся в памяти между диктовками, чтобы следующая начиналась сразу. С этой настройкой Keyboop отдаёт память системе после каждой диктовки, а следующая загружает модель заново. Загрузка начинается в момент нажатия и прячется, пока вы говорите, но короткая фраза может закончиться на секунду-две позже. Если памяти хватает, оставьте выключенным: модель в памяти работает быстрее.",
+                                 .en: "For Macs with little memory, such as 8 GB. A recognition model takes from about 150 MB to 1.6 GB and normally stays in memory between dictations so the next one starts right away. With this on, Keyboop hands the memory back to the system after every dictation, and the next one loads the model again. Loading starts the moment you press the shortcut and hides while you speak, but a short phrase may finish a second or two later. If you have enough memory, leave it off: a model kept in memory is faster."],
         "voice.retentionSub": [.ru: "По нему же пропадает копирование из меню",
                                .en: "Also drops copy-from-menu"],
-        "voice.retentionHelp": [.ru: "Через это время записи удаляются, и вместе с ними пропадает пункт «Скопировать последнюю диктовку» в меню: копировать ему становится нечего. Если диктуете подолгу и возвращаетесь к сказанному через час, ставьте срок побольше. «Не удалять» хранит последние 50 записей, пока вы сами их не сотрёте.",
-                                .en: "After this time entries are deleted, and the menu item “Copy last dictation” goes with them: there is nothing left for it to copy. If you dictate over long sessions and come back to what you said an hour later, pick a longer period. “Keep” holds the last 50 entries until you erase them yourself."],
+        "voice.retentionHelp": [.ru: "Через это время записи удаляются, и вместе с ними пропадает пункт «Скопировать последнюю диктовку» в меню: копировать ему становится нечего. Если диктуете подолгу и возвращаетесь к сказанному через час, ставьте срок побольше. 7 и 30 дней превращают историю в журнал с поиском. При любом сроке хранятся не больше 3000 последних диктовок и 100 скопированных строк: более старые уходят сами, даже при «Не удалять».",
+                                .en: "After this time entries are deleted, and the menu item “Copy last dictation” goes with them: there is nothing left for it to copy. If you dictate over long sessions and come back to what you said an hour later, pick a longer period. 7 and 30 days turn History into a searchable log. Whatever the period, at most the last 3000 dictations and 100 copied snippets are kept: older ones go on their own, even with “Keep all”."],
         // ⚠️ ГОВОРИМ, ЧТО ИМЕННО СКОПИРОВАНО (автор 08.08). Голое «Скопировано» ничего не сообщало,
         // а у того, кто настроил правый клик не на копирование, оно и вовсе подтверждало действие,
         // которого человек не совершал.
+        // Отказ Parakeet (отзыв #161, macOS 14 + CoreML). Молчать нельзя: человек видит только
+        // «Распознаю» и пустоту, а причина лежит в логе, куда он не заглянет.
+        "voice.parakeetFell":  [.ru: "Parakeet не ответил, распознаю через Whisper",
+                                .en: "Parakeet did not answer, using Whisper instead"],
+        "voice.parakeetNoAlt": [.ru: "Parakeet не работает на этой macOS. Скачайте модель Whisper в настройках",
+                                .en: "Parakeet does not work on this macOS. Download a Whisper model in settings"],
         "menu.copyLastDone": [.ru: "Скопирована последняя диктовка", .en: "Last dictation copied"],
         // Редкий случай: срок хранения истёк между открытием меню и кликом. В остальных ситуациях
         // пункта в меню просто нет, поэтому объяснять «история выключена» здесь уже не нужно.
@@ -1186,7 +1438,7 @@ enum L10n {
                            .en: "Audio and recognition never leave the Mac. History is encrypted and stays only on this device."],
         "voice.hkRopt":   [.ru: "Правый ⌥  (right Option)", .en: "Right ⌥  (right Option)"],
         "voice.hkRcmd":   [.ru: "Правый ⌘  (right Command)", .en: "Right ⌘  (right Command)"],
-        "voice.hkTilde":  [.ru: "⌥`  (Option + ё/`)", .en: "⌥`  (Option + backtick)"],
+        "voice.hkTilde":  [.ru: "⌥`  (Option + клавиша под Esc)", .en: "⌥`  (Option + the key under Esc)"],
         "voice.mic":      [.ru: "Микрофон", .en: "Microphone"],
         "voice.micSystem":[.ru: "По умолчанию (система)", .en: "Default (system)"],
         // ⚠️ Было «Открыть настройки звука…», и это читалось как наш собственный звук записи,

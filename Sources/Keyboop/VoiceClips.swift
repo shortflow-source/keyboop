@@ -19,7 +19,9 @@ import Foundation
 /// **2. Шифруем тем же ключом, что и текст истории.** Класть открытый m4a рядом с зашифрованным
 /// `history.enc` было бы бессмысленно: голос восстанавливает содержание диктовки не хуже текста, и
 /// незашифрованный клип стал бы самым слабым звеном. Ключ живёт в Keychain, см. `VoiceHistory`.
-/// Проигрываем из памяти (`AVAudioPlayer(data:)`), расшифрованный файл на диск не кладём НИКОГДА.
+/// Проигрываем из памяти (`AVAudioPlayer(data:)`), автоматически расшифрованный файл на диск не
+/// кладём. Единственное исключение — явная команда человека «Сохранить аудио…»: тогда байты из
+/// `data(for:)` пишутся в выбранный им `.m4a`, не появляясь в нашем Application Support или temp.
 ///
 /// **3. Клип живёт ровно столько, сколько его запись.** Отдельного срока хранения нет намеренно:
 /// два разных срока на одну и ту же диктовку это два разных обещания, и человек неизбежно решит,
@@ -116,6 +118,33 @@ enum VoiceClips {
         }
     }
 
+    /// Формат клипа, общий для диктовки и импорта файла (задача 229): AAC 16 кГц моно, на выходе
+    /// ~34 кбит/с (таблица замеров выше). Импорт пишет этот же формат потоково, по ходу чтения.
+    static let encoderSettings: [String: Any] = [
+        AVFormatIDKey:         kAudioFormatMPEG4AAC,
+        AVSampleRateKey:       16_000.0,
+        AVNumberOfChannelsKey: 1,
+        AVEncoderBitRateKey:   16_000,
+    ]
+
+    /// Сохранить уже закодированный .m4a (импорт файла, задача 229). Байты шифруются так же, как у
+    /// диктовки; огибающая приходит снаружи, потому что сэмплов целиком у импорта нет никогда.
+    static func saveEncoded(_ raw: Data, wave: [UInt8]) -> (id: String, wave: [UInt8])? {
+        guard AppSettings.shared.voiceSaveAudio, !raw.isEmpty, let key = VoiceHistory.storageKey else { return nil }
+        do {
+            let sealed = try AES.GCM.seal(raw, using: key)
+            guard let combined = sealed.combined else { return nil }
+            let id = UUID().uuidString
+            try combined.write(to: url(id), options: [.atomic])
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url(id).path)
+            kbLog("аудио импорта: сохранено \(combined.count / 1024) КБ")
+            return (id, wave)
+        } catch {
+            kbLog("аудио импорта: не зашифровать (\(error))")
+            return nil
+        }
+    }
+
     /// [Float] 16 кГц моно → AAC .m4a. Возвращает байты файла.
     private static func encodeAAC(samples: [Float], to tmp: URL) -> Data? {
         guard let inFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
@@ -127,12 +156,7 @@ enum VoiceClips {
         samples.withUnsafeBufferPointer { src in
             dst.update(from: src.baseAddress!, count: samples.count)
         }
-        let settings: [String: Any] = [
-            AVFormatIDKey:         kAudioFormatMPEG4AAC,
-            AVSampleRateKey:       16_000.0,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderBitRateKey:   16_000,   // на выходе ~34 кбит/с, см. таблицу замеров выше
-        ]
+        let settings = encoderSettings
         // ⚠️ ФАЙЛ ОБЯЗАН БЫТЬ ЗАКРЫТ ДО ЧТЕНИЯ БАЙТОВ, и ровно это делает вложенный do: `AVAudioFile`
         // дописывает заголовок контейнера в deinit. Прочитанный при живом объекте .m4a получается
         // битым, и `AVAudioPlayer(data:)` возвращает nil — поймано на стенде, где сразу все
@@ -154,7 +178,8 @@ enum VoiceClips {
 
     // MARK: - Чтение и удаление
 
-    /// Расшифрованные байты .m4a для `AVAudioPlayer(data:)`. На диск ничего не кладём.
+    /// Расшифрованные байты .m4a для `AVAudioPlayer(data:)` и явного экспорта человеком.
+    /// Сам метод на диск ничего не кладёт.
     static func data(for id: String) -> Data? {
         guard let key = VoiceHistory.storageKey,
               let blob = try? Data(contentsOf: url(id)),

@@ -314,6 +314,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         sidebar.onSelect = { [weak self] s in self?.detail.show(s) }
         detail.observeCapsRemap()
+        if ReleaseFeatures.slap { detail.observeSlapAvailability() }
         detail.onLanguageChanged = { [weak self] in
             // Тоже откладываем: приходит из action popup'а языка, а reshow сносит сам popup.
             DispatchQueue.main.async {
@@ -445,7 +446,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// имя и версия идут рядом, а не одно под другим.
     private func makeBrandBlock() {
         guard brandBlock.arrangedSubviews.isEmpty else { return }
-        let icon = NSImageView(image: NSApp.applicationIconImage)
+        let icon = NSImageView(image: DockPresence.bundleIcon)
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.translatesAutoresizingMaskIntoConstraints = false
         // ⚠️ 36, А НЕ 22. автор дважды: «превращается в кашу, все мелкие детали». Внутри знака рамка
@@ -709,7 +710,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             // закрывали, а просто позвали настройки повторно), возвращаем простой экран здесь.
             if bodyChild !== rootVC { proVisit = false; applyMode(animate: false) }
             rootVC.showRoot()
-            NSApp.setActivationPolicy(.regular)
+            DockPresence.acquire(.settings)
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKeyAndOrderFront(nil)
             return
@@ -729,7 +730,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // Пока открыты настройки — показываем иконку в Доке. У LSUIElement-агента её нет, а меню-бар у
         // многих переполнен (наш пункт не умещается и его не видно). Док — надёжный способ вернуться в
         // приложение. На закрытии снова прячем (windowWillClose) — в простое остаёмся чистым агентом.
-        NSApp.setActivationPolicy(.regular)
+        // С 04.09.2026 причин две (ещё окно истории), поэтому политика собрана в DockPresence.
+        DockPresence.acquire(.settings)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
     }
@@ -769,12 +771,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // молча отбрасывалось guard-ом. Возвращаем простой экран сразу при закрытии, пока окно
         // не видно, чтобы следующее открытие не перестраивало его на глазах.
         if wasGuest, showingSimple { applyMode(animate: false) }
-        NSApp.setActivationPolicy(.accessory)   // настройки закрыты → убираем иконку из Дока (снова агент)
+        DockPresence.release(.settings)   // настройки закрыты → значок из Dock уходит, если его не держит история
     }
     /// Фокус вернулся к окну (напр. удалили файл модели в Finder и переключились обратно) — освежаем
     /// статус моделей, если открыт раздел «Голос», чтобы «Установлена/Скачать» отражали реальность на диске.
     func windowDidBecomeKey(_ notification: Notification) {
         detail.revalidateVoiceIfShown()
+        detail.revalidatePrivacyIfShown()
     }
     /// Обновить поля (напр. список «Выученные» после обучения на отмене), если окно открыто.
     func reload() { if window?.isVisible == true { detail.reload() } }
@@ -1108,6 +1111,9 @@ final class DetailVC: NSViewController {
     private let column = FlippedView()           // колонка контента с ограниченной шириной
     private var contentStack: NSStackView?
     private var currentSection: SettingsSection = .switching
+    /// Несколько runtime-сигналов жеста могут прийти внутри одного action тумблера. Схлопываем их
+    /// в одну безопасную пересборку на следующем проходе main loop.
+    private var slapReshowPending = false
     /// Ширина колонки. Один и тот же класс обслуживает и разделы Pro, и корневой простой экран,
     /// потому что все кирпичи строк (`card`, `switchRow`, `controlRow`, `settingRow`) приватные:
     /// отдельный контроллер потребовал бы вынести их наружу, то есть переписать работающий Pro
@@ -1379,6 +1385,16 @@ final class DetailVC: NSViewController {
 
     func reshow() { showingRoot ? showRoot() : show(currentSection) }
 
+    private func scheduleSlapReshow() {
+        guard !slapReshowPending else { return }
+        slapReshowPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.slapReshowPending = false
+            self.reshow()
+        }
+    }
+
     /// Высота собранного корневого экрана. Считает сам стек: строк мало, все известны, и гадать
     /// «на бумаге» тут незачем, в отличие от Pro, где высота берётся по самому длинному разделу.
     /// Сколько высоты съедает прозрачный заголовок окна. Окно у нас `.fullSizeContentView`, то есть
@@ -1466,6 +1482,19 @@ final class DetailVC: NSViewController {
             self.reshow()
         }
     }
+
+    /// Первый живой HID-report приходит уже после того, как человек включил жест. Обновляем только
+    /// открытый раздел «Общие», не дёргая остальные формы и недонабранные поля.
+    func observeSlapAvailability() {
+        NotificationCenter.default.addObserver(forName: .keyboopSlapAvailabilityChanged,
+                                              object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.currentSection == .general else { return }
+            // `.checking` приходит синхронно из action тумблера. Не сносим сам NSSwitch, пока
+            // AppKit ещё выполняет его action; соседние slap-handler-ы по той же причине откладывают
+            // перестройку на следующий проход main loop.
+            self.scheduleSlapReshow()
+        }
+    }
     /// Дешёвая сигнатура файлов моделей на диске (имя+размер+mtime). Меняется ровно тогда, когда
     /// модель скачали/удалили/подменили — включая удаление ИЗВНЕ через Finder.
     private func modelsSignature() -> String {
@@ -1490,6 +1519,18 @@ final class DetailVC: NSViewController {
     /// каждую активацию окна прогонял SwiftUI-графы всех контролов раздела по 2–3 раза за открытие
     /// и умножал частоту PAC-краша на macOS 26 в разы (см. RowMetrics). Фикс 16.07 при этом цел:
     /// удалили модель в Finder → сигнатура другая → пересборка происходит.
+    /// Скрытый ввод мог наладиться (или начаться), пока окно было в фоне. Раздел «Приватность»
+    /// показывает объяснение по состоянию, значит состояние надо пере-спрашивать: иначе человек
+    /// видит инструкцию про уже снятую блокировку или, наоборот, не видит про текущую.
+    private var lastSecureShown: Bool?
+    func revalidatePrivacyIfShown() {
+        guard currentSection == .privacy else { return }
+        let now = AppHealth.iconState == .secureInput
+        guard now != lastSecureShown else { return }
+        lastSecureShown = now
+        reshow()
+    }
+
     func revalidateVoiceIfShown() {
         guard currentSection == .voice else { return }
         let sig = modelsSignature()
@@ -1580,15 +1621,24 @@ final class DetailVC: NSViewController {
         // опции, чтобы всё смотрелось как одна красивая панель»). В Pro карточки группируют настройки
         // по смыслу, и их там много. Здесь строк четыре, и группировать нечего: рамка вокруг каждой
         // делила экран на куски там, где делить не надо.
+        // ⚠️ ТРИ ПОЛЯ ВЫБОРА ХОТКЕЯ ОДНОЙ ШИРИНЫ (автор 21.08.2026: «почему-то начать диктовку
+        // больше»). Каждый из этих контролов задаёт себе ТОЛЬКО минимум в 230 и дальше растёт под
+        // самый длинный пункт своего списка — а списки у них разные, поэтому и ширины выходили
+        // разные. Связываем их равенством: ширину выберет самый широкий, остальные подтянутся.
+        // Ставить общее ЧИСЛО нельзя: длина пунктов зависит от языка интерфейса, и число, верное
+        // для русского, обрежет английский (или наоборот).
+        let manualKey = HotkeyControl()
+        let voiceKey = VoiceHotkeyControl()
+        let translateKey = TranslateHotkeyControl()
         var rows: [NSView] = [
-            controlRow(L10n.t("root.manual"), HotkeyControl(), subtitle: L10n.t("root.manualSub"),
+            controlRow(L10n.t("root.manual"), manualKey, subtitle: L10n.t("root.manualSub"),
                        help: L10n.t("switch.manualHelp"), key: "switch.manual", wraps: true),
-            controlRow(L10n.t("root.voiceKey"), VoiceHotkeyControl(),
+            controlRow(L10n.t("root.voiceKey"), voiceKey,
                        subtitle: L10n.t(settings.voiceHoldMode == "toggle" ? "root.voiceKeySub"
                                                                           : "root.voiceKeySubHold"),
                        help: L10n.t("root.voiceKeyHelp"), key: "voice.hotkey", wraps: true)
         ]
-        rows.append(controlRow(L10n.t("root.tr"), TranslateHotkeyControl(), enabled: translateAvailable,
+        rows.append(controlRow(L10n.t("root.tr"), translateKey, enabled: translateAvailable,
                                subtitle: L10n.t("root.trSub"), help: L10n.t("root.trHelp"),
                                key: "tr.hotkey", wraps: true))
 
@@ -1599,7 +1649,15 @@ final class DetailVC: NSViewController {
         var items: [NSView] = [group(headerRoom), card(rows, vPad: 8)]
         if !translateAvailable { items += [group(6), hint(L10n.t("wel.trNeedOS"))] }
         items += [group(6), rootFooter()]
-        return vstack(items)
+        let root = vstack(items)
+
+        // ⚠️ СВЯЗЫВАЕМ ШИРИНЫ ТОЛЬКО ПОСЛЕ СБОРКИ ДЕРЕВА. Связь между двумя видами требует общего
+        // предка НА МОМЕНТ ВКЛЮЧЕНИЯ: включённая раньше, она роняет приложение исключением
+        // Auto Layout прямо на открытии настроек (поймано сборкой 21.08, приложение не поднималось).
+        for c in [voiceKey as NSView, translateKey as NSView] {
+            c.widthAnchor.constraint(equalTo: manualKey.widthAnchor).isActive = true
+        }
+        return root
     }
 
     /// Подвал: единственное место, где приложение говорит, что оно для тебя сделало.
@@ -1660,7 +1718,8 @@ final class DetailVC: NSViewController {
                 switchRow(L10n.t("switch.dev"), L10n.t("switch.devSub"), settings.developerMode, #selector(toggleDev),
                           help: L10n.t("switch.devHelp"), key: "switch.dev"),
                 controlRow(L10n.t("switch.manual"), HotkeyControl(),
-                           subtitle: L10n.t("switch.manualSub"), help: L10n.t("switch.manualHelp"),
+                           subtitle: manualCapsFailure() ?? L10n.t("switch.manualSub"),
+                           help: L10n.t("switch.manualHelp"),
                            key: "switch.manual"),
                 groupConvertRow()            // «переключать несколько слов» — сразу после ручного хоткея
             ]),
@@ -2276,21 +2335,41 @@ final class DetailVC: NSViewController {
             sub(L10n.t("priv.body")),
             group(2),
             sub(L10n.t("priv.body2")),
-            // ⚠️ ВТОРОЙ ПРОЦЕСС НАЗЫВАЕМ САМИ (задача 96). Строка появляется, только когда сторож
-            // реально нужен, то есть когда мгновенное переключение висит на 🌐. Человек, увидевший
-            // в Мониторинге системы два «Keyboop», должен найти объяснение у нас, а не гадать —
+            // ⚠️ ВТОРОЙ ПРОЦЕСС НАЗЫВАЕМ САМИ (задачи 96 + 35). Теперь он спит всю сессию,
+            // поэтому объяснение тоже постоянно. Человек, увидевший в Мониторинге системы два
+            // «Keyboop», должен найти объяснение у нас, а не гадать —
             // необъяснённый второй процесс у программы, которая читает клавиатуру, выглядит ровно
             // так, как выглядят вещи, из-за которых люди боятся ставить переключатели раскладки.
             globeGuardNote(),
+            secureInputNote(),
             group(6),
             hint(L10n.t("priv.foot"))
         ])
     }
 
-    /// Строка про сторожа клавиши 🌐 — только когда он живёт (см. `buildPrivacy`).
+    /// Объяснение скрытого ввода — ТОЛЬКО когда он реально мешает (решение автора 26.08.2026).
+    ///
+    /// Сначала это было отдельным модальным окном по клику в меню, и автор его отверг: «мне просто не
+    /// нравится отдельно всплывающее окно, большое с длинным текстом, странно выглядит». И он прав:
+    /// пять абзацев в NSAlert это стена, которую закрывают не читая.
+    ///
+    /// Здесь у текста есть свой дом. Раздел «Приватность» человек открывает именно с вопросом «что
+    /// эта программа видит и почему», и объяснение про защищённый ввод отвечает ровно на него. А
+    /// пока всё в порядке, блока нет вовсе: постоянная плашка про то, чего сейчас не происходит,
+    /// за неделю превращается в фон.
+    private func secureInputNote() -> NSView {
+        guard AppHealth.iconState == .secureInput else { return group(0) }
+        return vstack([
+            group(8),
+            blockTitle("health.secureInput"),
+            sub(L10n.t("health.secureInputWho"))
+        ])
+    }
+
+    /// Объединённый сторож живёт всю сессию приложения — показываем его честно всегда.
     private func globeGuardNote() -> NSView {
-        guard settings.instantSwitchEnabled, settings.instantSwitchMode == "globe" else { return group(0) }
-        return vstack([group(2), sub(L10n.t("priv.guard"))])
+        let key = ReleaseFeatures.slap ? "priv.guard" : "priv.guardNoSlap"
+        return vstack([group(2), sub(L10n.t(key))])
     }
 
     /// Общие — настройки уровня приложения: язык интерфейса, автозапуск, доступ Accessibility.
@@ -2357,12 +2436,24 @@ final class DetailVC: NSViewController {
         iconSeg.selectedSegment = iconStyleKeys.firstIndex(of: settings.menuBarStyle) ?? 1
         iconSeg.target = self; iconSeg.action = #selector(iconStyleSegChanged(_:))
 
-        // БЫСТРОЕ ДЕЙСТВИЕ ПРАВЫМ КЛИКОМ (задача 21). Порядок пунктов не случайный: первым стоит
-        // умолчание, дальше по убыванию пользы, как договорились с автором 05.08.
+        // БЫСТРЫЕ ДЕЙСТВИЯ: правый клик сохраняет прежнее поведение и storage, а шлепок получает
+        // собственные enable/action/sound. Списки различаются намеренно: клик по status item забирает
+        // фокус у чужого поля, поэтому ручное исправление доступно только жесту.
         let quickPop = NSPopUpButton()
-        quickPop.addItems(withTitles: quickActionKeys.map { L10n.t("quick." + $0) })
-        quickPop.selectItem(at: quickActionKeys.firstIndex(of: settings.quickAction) ?? 0)
+        quickPop.addItems(withTitles: quickActionOptions.map { L10n.t($0.l10nKey) })
+        quickPop.selectItem(at: quickActionOptions.firstIndex { $0.rawValue == settings.quickAction } ?? 0)
         quickPop.target = self; quickPop.action = #selector(quickActionChanged(_:))
+
+        let slapPop = NSPopUpButton()
+        slapPop.addItems(withTitles: slapActionOptions.map { L10n.t($0.l10nKey) })
+        slapPop.selectItem(at: slapActionOptions.firstIndex(of: settings.slapAction) ?? 0)
+        slapPop.target = self; slapPop.action = #selector(slapActionChanged(_:))
+
+        let slapSensitivityPop = NSPopUpButton()
+        slapSensitivityPop.addItems(withTitles: slapSensitivityOptions.map { L10n.t($0.l10nKey) })
+        slapSensitivityPop.selectItem(at: slapSensitivityOptions.firstIndex(of: settings.slapSensitivity) ?? 0)
+        slapSensitivityPop.target = self
+        slapSensitivityPop.action = #selector(slapSensitivityChanged(_:))
 
         let pausePop = NSPopUpButton()
         pausePop.addItems(withTitles: pauseLenMinutes.map(Pause.lengthLabel))
@@ -2373,21 +2464,56 @@ final class DetailVC: NSViewController {
         // Пункт исчезает из строки меню, только если убраны И значок, И индикатор языка: при
         // скрытом значке, но включённом языке в строке остаётся «RU/EN», и правый клик по нему
         // прекрасно работает. Гасить функцию в этом случае значило бы соврать.
-        let quickOK = !(settings.menuBarStyle == "hidden" && !settings.menuBarShowLanguage)
-        Self.setEnabledDeep(quickPop, quickOK)
-        Self.setEnabledDeep(pausePop, quickOK)
+        let rightClickAvailable = !(settings.menuBarStyle == "hidden" && !settings.menuBarShowLanguage)
+        Self.setEnabledDeep(quickPop, rightClickAvailable)
 
-        // Кнопка «i» остаётся живой даже когда строка приглушена: именно из неё человек и узнает,
-        // ПОЧЕМУ недоступно. Приглушённая строка без объяснения читается как поломка.
+        let slapSubtitle: String = {
+            guard settings.slapEnabled else { return L10n.t("quick.slapSub") }
+            switch settings.slapAvailability {
+            case .available:   return L10n.t("quick.slapReady")
+            case .unavailable: return L10n.t("quick.slapUnavailable")
+            case .checking, .disabled: return L10n.t("quick.slapChecking")
+            }
+        }()
+        // Кнопка «i» у правого клика остаётся живой даже когда строка приглушена: именно из неё
+        // человек узнает, почему действие сейчас недоступно.
         var quickRows: [NSView] = [
-            controlRow(L10n.t("quick.action"), quickPop, enabled: quickOK,
-                       help: L10n.t(quickOK ? "quick.help" : "quick.helpOff"), key: "quick.action")
+            controlRow(L10n.t("quick.rightClick"), quickPop, enabled: rightClickAvailable,
+                       help: L10n.t(rightClickAvailable ? "quick.help" : "quick.helpOff"),
+                       key: "quick.rightClick")
         ]
-        // «Сколько молчать» показываем ТОЛЬКО у паузы: остальным действиям эта строка не нужна и
-        // только засоряет раздел. Тот же приём, что у зависимых настроек в других разделах.
-        if settings.quickAction == "pause" {
-            quickRows.append(controlRow(L10n.t("quick.pauseLen"), pausePop, enabled: quickOK,
+        if ReleaseFeatures.slap {
+            quickRows.append(contentsOf: [
+                switchRow(L10n.t("quick.slap"), slapSubtitle, settings.slapEnabled,
+                          #selector(toggleSlap), key: "quick.slap"),
+                controlRow(L10n.t("quick.slapAction"), slapPop, enabled: settings.slapEnabled,
+                           key: "quick.slapAction")
+            ])
+            // Пока жест выключен, порог не нужен вовсе. При включении появляются заводская
+            // «Сбалансированная» и более отзывчивая «Высокая» — без неясного числового слайдера.
+            if settings.slapEnabled {
+                quickRows.append(controlRow(L10n.t("quick.sensitivity"), slapSensitivityPop,
+                                            key: "quick.sensitivity"))
+            }
+        }
+
+        // Длительность общая для обоих источников. Видимость правого клика не должна гасить её,
+        // когда «Не мешать» выбрано у включённого шлепка.
+        let pauseByRightClick = settings.quickAction == QuickAction.pause.rawValue
+        let pauseBySlap = ReleaseFeatures.slap
+            && settings.slapEnabled && settings.slapAction == .pause
+        if pauseByRightClick || pauseBySlap {
+            let pauseAvailable = (pauseByRightClick && rightClickAvailable)
+                || (pauseBySlap && settings.slapEnabled)
+            quickRows.append(controlRow(L10n.t("quick.pauseLen"), pausePop, enabled: pauseAvailable,
                                         key: "quick.pauseLen"))
+        }
+        // Тумблер показывает сохранённое «вкл», даже пока сам жест выключен: при включении шлепка
+        // звук не должен неожиданно менять заранее выбранное состояние.
+        if ReleaseFeatures.slap {
+            quickRows.append(switchRow(L10n.t("quick.slapSound"), nil, settings.slapSoundEnabled,
+                                       #selector(toggleSlapSound), enabled: settings.slapEnabled,
+                                       key: "quick.slapSound"))
         }
 
         var general: [NSView] = [
@@ -2415,7 +2541,7 @@ final class DetailVC: NSViewController {
             sectionTitle(L10n.t("quick.title")),
             card(quickRows),
             group(2),
-            hint(L10n.t("quick.sub")),
+            hint(L10n.t(ReleaseFeatures.slap ? "quick.sub" : "quick.subNoSlap")),
         ]
         if settings.menuBarStyle == "hidden" {
             // Значок скрыт — всегда объясняем, как добраться до приложения. Текст зависит от языка:
@@ -2427,6 +2553,23 @@ final class DetailVC: NSViewController {
             card([ switchRow(L10n.t("gen.silent"), L10n.t("gen.silentSub"),
                              !settings.silentMode, #selector(toggleSoundsEnabled), key: "gen.silent") ]),
             group(6),
+        ])
+        // PERSONAL: захват буфера выключен (`ReleaseFeatures.clipboardHistory`) — раздел не показываем.
+        if ReleaseFeatures.clipboardHistory { general.append(contentsOf: [
+            // Захват буфера в историю (задача 228). Стоит в «Общих», а не в голосовом наборе
+            // (решение автора 04.09.2026): буфер не имеет отношения к голосу, а общая история уже не
+            // только про диктовку. Зависит от «Хранить историю»: без неё строка гаснет и подсказка
+            // говорит, где включить. Остальные настройки истории остаются в голосовом наборе.
+            sectionTitle(L10n.t("gen.history")),
+            card([ switchRow(L10n.t("gen.clipHistory"),
+                             settings.voiceHistoryEnabled ? L10n.t("gen.clipHistorySub") : L10n.t("gen.clipHistoryNeedsHistory"),
+                             settings.voiceHistoryEnabled && settings.clipboardHistoryEnabled, #selector(toggleClipboardHistory),
+                             enabled: settings.voiceHistoryEnabled, help: L10n.t("gen.clipHistoryHelp"), key: "gen.clipHistory") ]),
+            group(2),
+            hint(L10n.t("gen.historyHint")),
+            group(6),
+        ]) }
+        general.append(contentsOf: [
             sectionTitle(L10n.t("gen.access")),
             card([ buttonRow([perm, mic]) ]),
             group(2),
@@ -2469,26 +2612,65 @@ final class DetailVC: NSViewController {
     /// Что применить, если человек нажмёт «Назначить». Пока nil — применять нечего.
     private var hkPendingApply: (() -> Void)?
 
+    /// ⚠️ ЗАМОРОЗКА КАНДИДАТА (автор 07.09.2026: «клавиши приходится УДЕРЖИВАТЬ, чтобы назначить»).
+    ///
+    /// Было так: набранное сочетание включало кнопку «Назначить», но следующий же `flagsChanged` —
+    /// то есть отпускание клавиш — перерисовывал панель как незавершённую и кнопку гасил. Значит
+    /// нажать её можно было, только держа сочетание пальцами и целясь мышью. В контролах записи
+    /// для конверсии, диктовки, перевода и мгновенного переключения этого нет с самого начала: там
+    /// кандидат ЗАМОРАЖИВАЕТСЯ и переживает отпускание (см. `HotkeyControl.freeze`). Разъехались
+    /// две реализации, а не задумка, поэтому здесь повторяется ровно та же машинка состояний.
+    private var hkFrozen = false
+    /// Показали отказ, а клавиши ещё физически зажаты: их отпускание по одной приходит обычным
+    /// `flagsChanged` и иначе читалось бы как начало нового набора. Ждём чистого нуля.
+    private var hkAwaitingRelease = false
+    /// Предыдущий набор модификаторов — отличить «отпускает старое» от «начал новое».
+    private var hkLastMods: CGEventFlags = []
+
+    /// Человек начал набирать заново: модификаторы пошли вверх с нуля.
+    private func hkShouldRestart(_ mods: CGEventFlags) -> Bool { !mods.isEmpty && hkLastMods.isEmpty }
+
+    /// Сбросить замороженного кандидата перед новым набором.
+    private func hkRestartIfFrozen() {
+        guard hkFrozen else { return }
+        hkFrozen = false
+        hkPendingApply = nil
+    }
+
+    /// Отказ БЕЗ прерывания записи: причина видна в самой панели, человек жмёт другое сочетание.
+    private func hkWarn(_ text: String, parts: [String]) {
+        hkFrozen = false
+        hkPendingApply = nil
+        hkAwaitingRelease = true
+        HotkeyRecorderPanel.shared.warn(text, parts: parts)
+    }
+
     /// `what` — что настраиваем (заголовок окна записи), `slot` — чья это комбинация в общем реестре
     /// (иначе проверка «занято нашей же функцией» ругалась бы на саму настраиваемую строку),
     /// `apply` получает готовую комбинацию и её подпись вида «⌃⌥U».
     private func startHotkeyRecording(what: String, slot: HotkeyGuard.Slot,
                                       apply: @escaping (Int, CGEventFlags, String) -> Void) {
         hkPendingApply = nil
+        // Прошлую запись могли завершить с зажатыми модификаторами — начинаем с чистого состояния.
+        hkFrozen = false; hkAwaitingRelease = false; hkLastMods = []
         HotkeyRecording.begin(stop: { [weak self] in self?.stopHotkeyRecording() }, in: view.window)
         HotkeyRecorderPanel.shared.show(what: what, over: view.window,
                                         onCommit: { [weak self] in self?.commitHotkeyRecording() },
                                         onCancel: { [weak self] in self?.stopHotkeyRecording() })
         hkRecMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] e in
             guard let self else { return nil }
+            // Продлеваем сторожа записи: человек перебирает варианты, это не простой. Второй пункт
+            // того же расхождения двух реализаций — в контролах `UIControls` строка есть с самого
+            // начала, здесь её не было, и запись умирала через 90 секунд подбора.
+            HotkeyRecording.noteActivity()
             let mods = CGEventFlags(rawValue: UInt64(e.modifierFlags.rawValue))
                 .intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
             if e.type == .keyDown {
                 guard e.keyCode != 53 else { self.stopHotkeyRecording(); return nil }
+                self.hkRestartIfFrozen()
                 // Одиночная клавиша без модификаторов отобрала бы у человека обычный ввод.
                 guard !mods.isEmpty else {
-                    HotkeyRecorderPanel.shared.warn(L10n.t("snip.needMods"),
-                                                    parts: HotkeyRecorderPanel.parts(mods: mods))
+                    self.hkWarn(L10n.t("snip.needMods"), parts: HotkeyRecorderPanel.parts(mods: mods))
                     return nil
                 }
                 let parts = HotkeyRecorderPanel.parts(mods: mods,
@@ -2497,7 +2679,7 @@ final class DetailVC: NSViewController {
                 // отдаём решение человеку. Своих правил здесь нет намеренно.
                 switch HotkeyGuard.verdict(keyCode: Int(e.keyCode), mods: mods) {
                 case .blocked(let busy):
-                    HotkeyRecorderPanel.shared.warn(HotkeyGuard.busyMessage(busy), parts: parts)
+                    self.hkWarn(HotkeyGuard.busyMessage(busy), parts: parts)
                     return nil
                 case .warn(let who):
                     self.armHotkey(keyCode: Int(e.keyCode), mods: mods, parts: parts, slot: slot,
@@ -2508,7 +2690,21 @@ final class DetailVC: NSViewController {
                 }
                 return nil
             }
-            HotkeyRecorderPanel.shared.render(parts: HotkeyRecorderPanel.parts(mods: mods), complete: false)
+            // flagsChanged: живой показ зажатых модификаторов — и только он.
+            if self.hkAwaitingRelease {
+                self.hkLastMods = mods
+                if mods.isEmpty { self.hkAwaitingRelease = false }
+                return nil
+            }
+            // Кандидат заморожен: отпускание клавиш его не трогает, кнопка «Назначить» остаётся живой.
+            // Сбрасываем, только когда человек начал набирать заново (модификаторы пошли вверх с нуля).
+            if self.hkFrozen, !self.hkShouldRestart(mods) { self.hkLastMods = mods; return nil }
+            self.hkRestartIfFrozen()
+            self.hkLastMods = mods
+            // Пустой набор не рисуем: иначе отпускание затирало бы предупреждение о конфликте.
+            if !mods.isEmpty {
+                HotkeyRecorderPanel.shared.render(parts: HotkeyRecorderPanel.parts(mods: mods), complete: false)
+            }
             return nil
         }
     }
@@ -2518,12 +2714,12 @@ final class DetailVC: NSViewController {
     private func armHotkey(keyCode: Int, mods: CGEventFlags, parts: [String], slot: HotkeyGuard.Slot,
                            apply: @escaping (Int, CGEventFlags, String) -> Void, warning: String?) {
         if let busy = HotkeyGuard.ourBusy(mode: "key", keyCode: keyCode, mods: mods.rawValue, excluding: slot) {
-            hkPendingApply = nil
-            HotkeyRecorderPanel.shared.render(parts: parts, complete: false,
-                                              warning: String(format: L10n.t("hkrec.warn.ours"), busy))
+            hkWarn(String(format: L10n.t("hkrec.warn.ours"), busy), parts: parts)
             return
         }
         hkPendingApply = { apply(keyCode, mods, parts.joined()) }
+        // Замораживаем: набранное остаётся на экране и переживает отпускание клавиш.
+        hkFrozen = true
         HotkeyRecorderPanel.shared.render(parts: parts, complete: true, warning: warning)
     }
 
@@ -2537,6 +2733,7 @@ final class DetailVC: NSViewController {
     private func stopHotkeyRecording() {
         if let m = hkRecMonitor { NSEvent.removeMonitor(m); hkRecMonitor = nil }
         hkPendingApply = nil
+        hkFrozen = false; hkAwaitingRelease = false; hkLastMods = []
         HotkeyRecording.end()
         HotkeyRecorderPanel.shared.hide()
         reshow()
@@ -2546,6 +2743,114 @@ final class DetailVC: NSViewController {
         startHotkeyRecording(what: L10n.t("snip.pickOn"), slot: .snippet) { [weak self] code, mods, _ in
             self?.settings.snippetPickKeyCode = code
             self?.settings.snippetPickModifiers = mods.rawValue
+        }
+    }
+
+    /// Готовые сочетания для вставки последней диктовки. Их ДВА, и это осознанно.
+    ///
+    /// ⚠️ ПЕРВЫЙ В СПИСКЕ = УМОЛЧАНИЕ (тумблер, включаясь, ставит первое СВОБОДНОЕ), поэтому порядок
+    /// здесь поведение, а не оформление.
+    ///
+    /// ⚠️ ТРИ МОДИФИКАТОРА ОТВЕРГНУТЫ (автор 07.09.2026): «неудобно, такое обычно не делают, надо все
+    /// пальцы обеих рук». До этого умолчанием стоял ⌃⌥D, и он оказался занят сторонним приложением
+    /// (Claude Code для Mac); попытка уйти от чужих хоткеев в ⌃⌥⌘V решала одну проблему ценой
+    /// другой. Правило, которое из этого следует: **лучше меньше готовых вариантов, но нажимаемых
+    /// одной рукой**. Кому оба не подошли, назначает своё — пункт «Назначить свою…» есть всегда.
+    ///
+    /// Чем проверяли: `SystemHotkeys.takenBy` спрашивает саму macOS (прогон полусотни кандидатов на
+    /// живой машине — занято только ⌃⌥Space, «предыдущий источник ввода»). Про чужие ПРОГРАММЫ
+    /// система не знает ничего, и списка таких сочетаний не существует, поэтому окончательную
+    /// проверку делает человек: не сработало — меняет.
+    ///
+    /// Буква V от «вставить», как у вставки без формата и у панели сниппетов: общая мнемоника.
+    /// ⌃⌥V стоит вторым не случайно — ровно оно умолчание у панели сниппетов (`snipPickPresets`),
+    /// и первым означало бы, что у человека со включёнными сниппетами тумблер молча уезжает на
+    /// второй вариант. Занятое своей же функцией отсекает `ourBusy`, так что в списке оно остаётся.
+    ///
+    /// ⌥⇧ и ⌘-сочетания сюда не берём: ⌥⇧ это заводская комбинация конверсии, а ⇧⌘V/⌥⌘V/⌃⌘V —
+    /// готовые варианты вставки без форматирования.
+    static let pasteDictationPresets: [(String, Int, UInt64)] = [
+        ("⌃⇧V", 9, CGEventFlags([.maskControl, .maskShift]).rawValue),
+        ("⌃⌥V", 9, CGEventFlags([.maskControl, .maskAlternate]).rawValue),
+    ]
+
+    /// Строки настройки «вставлять последнюю диктовку». Показываем ВСЕГДА, даже когда история
+    /// выключена: человек ищет функцию там, где про неё думает, а зависимость объясняет подпись
+    /// и подсказка. Сама вставка при выключенной истории честно скажет тостом, чего не хватает.
+    private func pasteDictationRows() -> [NSView] {
+        let pop = NSPopUpButton()
+        var titles = Self.pasteDictationPresets.map { $0.0 }
+        var sel = Self.pasteDictationPresets.firstIndex {
+            $0.1 == settings.pasteDictationKeyCode && $0.2 == settings.pasteDictationModifiers
+        }
+        // Своё записанное сочетание в готовых не найдётся, а список обязан показывать ТО, что
+        // работает (та же причина, что у смены регистра).
+        if sel == nil, settings.pasteDictationEnabled, !settings.pasteDictationKeyLabel.isEmpty {
+            titles.append(settings.pasteDictationKeyLabel)
+            sel = titles.count - 1
+        }
+        pop.addItems(withTitles: titles + [L10n.t("snip.pickCustom")])
+        pop.selectItem(at: sel ?? 0)
+        pop.target = self; pop.action = #selector(pasteDictationComboChanged(_:))
+        var rows: [NSView] = [
+            switchRow(L10n.t("voice.pasteLast"), L10n.t("voice.pasteLastSub"), settings.pasteDictationEnabled,
+                      #selector(togglePasteDictation(_:)), help: L10n.t("voice.pasteLastHelp"),
+                      key: "voice.pasteLast")
+        ]
+        if settings.pasteDictationEnabled {
+            rows.append(controlRow(L10n.t("voice.pasteLastAssign"), pop, key: "voice.pasteLastAssign"))
+        }
+        return rows
+    }
+
+    @objc private func togglePasteDictation(_ sw: NSSwitch) {
+        if sw.state == .on {
+            // Включили — ставим первое СВОБОДНОЕ готовое сочетание: тумблер «вкл» без работающей
+            // комбинации выглядит как поломка (та же логика, что у смены регистра).
+            let free = Self.pasteDictationPresets.first {
+                HotkeyGuard.ourBusy(mode: "key", keyCode: $0.1, mods: $0.2, excluding: .pasteDictation) == nil
+            }
+            // Оба готовых заняты нашими же функциями — не отбиваем тумблер алертом «назначьте своё
+            // через „Назначить свою…“»: этот пункт живёт в строке, которая видна ТОЛЬКО при
+            // включённом тумблере, то есть совет указывал бы на то, чего человек не видит. Вместо
+            // этого сразу открываем запись сочетания. Отменил — `reshow` вернёт тумблер в «выкл»
+            // сам, потому что комбинация так и осталась не назначенной.
+            guard let preset = free else {
+                startPasteDictationHotkeyRecording()
+                return
+            }
+            settings.pasteDictationKeyCode = preset.1
+            settings.pasteDictationModifiers = preset.2
+            settings.pasteDictationKeyLabel = preset.0
+        } else {
+            settings.pasteDictationKeyCode = -1
+            settings.pasteDictationModifiers = 0
+            settings.pasteDictationKeyLabel = ""
+        }
+        reshow()
+    }
+
+    @objc private func pasteDictationComboChanged(_ p: NSPopUpButton) {
+        let i = p.indexOfSelectedItem
+        if i == p.numberOfItems - 1 {            // последняя строка — «Назначить свою…»
+            startPasteDictationHotkeyRecording()
+            return
+        }
+        guard i >= 0, i < Self.pasteDictationPresets.count else { return }
+        let preset = Self.pasteDictationPresets[i]
+        if let busy = HotkeyGuard.ourBusy(mode: "key", keyCode: preset.1, mods: preset.2, excluding: .pasteDictation) {
+            HotkeyGuard.busyAlert(busy); reshow(); return
+        }
+        settings.pasteDictationKeyCode = preset.1
+        settings.pasteDictationModifiers = preset.2
+        settings.pasteDictationKeyLabel = preset.0
+    }
+
+    private func startPasteDictationHotkeyRecording() {
+        startHotkeyRecording(what: L10n.t("hkrec.what.pasteLast"), slot: .pasteDictation) { [weak self] code, mods, label in
+            self?.settings.pasteDictationKeyCode = code
+            self?.settings.pasteDictationModifiers = mods.rawValue
+            self?.settings.pasteDictationKeyLabel = label
         }
     }
 
@@ -2677,13 +2982,33 @@ final class DetailVC: NSViewController {
         settings.snippetPickModifiers = preset.2
     }
 
-    /// Порядок = порядок в меню выбора. Первый элемент это умолчание.
-    private let quickActionKeys = ["copyVoice", "pause", "dictate", "history", "settings"]
+    /// Порядок = порядок в меню выбора. Первый элемент это умолчание каждого источника.
+    private let quickActionOptions = QuickAction.rightClickOptions
+    private let slapActionOptions = QuickAction.slapOptions
+    private let slapSensitivityOptions = SlapSensitivity.allCases
     private var pauseLenMinutes: [Int] { Pause.lengths }   // список один на меню и настройки
 
     @objc private func quickActionChanged(_ p: NSPopUpButton) {
-        settings.quickAction = quickActionKeys[max(0, min(quickActionKeys.count - 1, p.indexOfSelectedItem))]
+        let i = max(0, min(quickActionOptions.count - 1, p.indexOfSelectedItem))
+        settings.quickAction = quickActionOptions[i].rawValue
         reshow()   // строка «Сколько молчать» есть только у паузы, раздел надо пересобрать
+    }
+    @objc private func slapActionChanged(_ p: NSPopUpButton) {
+        let i = max(0, min(slapActionOptions.count - 1, p.indexOfSelectedItem))
+        settings.slapAction = slapActionOptions[i]
+        reshow()
+    }
+    @objc private func slapSensitivityChanged(_ p: NSPopUpButton) {
+        let i = max(0, min(slapSensitivityOptions.count - 1, p.indexOfSelectedItem))
+        settings.slapSensitivity = slapSensitivityOptions[i]
+    }
+    @objc private func toggleSlap(_ s: NSSwitch) {
+        settings.slapEnabled = (s.state == .on)
+        // Перестройка меняет доступность соседних контролов; не сносим NSSwitch из его action.
+        scheduleSlapReshow()
+    }
+    @objc private func toggleSlapSound(_ s: NSSwitch) {
+        settings.slapSoundEnabled = (s.state == .on)
     }
     @objc private func pauseLenChanged(_ p: NSPopUpButton) {
         settings.pauseMinutes = pauseLenMinutes[max(0, min(pauseLenMinutes.count - 1, p.indexOfSelectedItem))]
@@ -2735,6 +3060,21 @@ final class DetailVC: NSViewController {
                                                     mods: settings.instantSwitchMods)
         guard let shadowed else { return hint(L10n.t("is.onClean")) }
         return hint(String(format: L10n.t("is.onShadow"), shadowed))
+    }
+
+    /// Caps отдан ручному переключению, но ремап не состоялся — сказать об этом ЗДЕСЬ.
+    ///
+    /// ⚠️ ЧУЖОЕ ПРЕДУПРЕЖДЕНИЕ НЕ ГОДИТСЯ. Такая же строка есть у мгновенного переключения, и её
+    /// условие (`CapsRemap.wanted`) теперь истинно и для нашего случая — но живёт она в ДРУГОМ
+    /// разделе и говорит, что сломана смена языка. Человек, назначивший Caps на конверсию, увидел
+    /// бы жалобу не про свою настройку, а в разделе, куда он не заходил.
+    /// Сам молчаливый отказ уже стоил нам живого случая: женщина написала в Директ, что не смогла
+    /// назначить Caps, и по логу нельзя было отличить «не нашла настройку» от «нашла, а она молча
+    /// не сработала».
+    private func manualCapsFailure() -> String? {
+        guard settings.hotkeyMode == "modkey", settings.hotkeyKeyCode == 57,
+              let f = CapsRemap.failure else { return nil }
+        return L10n.t(f == .foreignMapping ? "is.capsForeign" : "is.capsFailed")
     }
 
     /// СПАСАТЕЛЬНАЯ СТРОКА ДЛЯ ОСИРОТЕВШЕЙ 🌐 (задача 96).
@@ -3091,7 +3431,10 @@ final class DetailVC: NSViewController {
         let body: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]
         let gap: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 6)]
         for r in Changelog.releases {
-            s.append(NSAttributedString(string: "v\(r.version)\n", attributes: hdr))
+            // Пометка канала прямо в заголовке: человек читает «включите Ставить бета-версии» и
+            // должен видеть, что перед ним и есть та самая бета (задача 189).
+            let mark = r.beta ? (isRu ? "-бета" : " beta") : ""
+            s.append(NSAttributedString(string: "v\(r.version)\(mark)\n", attributes: hdr))
             for item in (isRu ? r.ru : r.en) {
                 s.append(NSAttributedString(string: "  •  \(item)\n", attributes: body))
             }
@@ -3153,8 +3496,11 @@ final class DetailVC: NSViewController {
                            subtitle: L10n.t("voice.langSub"), help: L10n.t("voice.langHelp"), key: "voice.lang"),
             ]),
             group(6),
+            // ⚠️ ПОДЗАГОЛОВОК ВПЛОТНУЮ К СВОЕЙ КАРТОЧКЕ, БЕЗ ПРОКЛАДКИ (автор 24.09.2026). Здесь после
+            // каждого из пяти подзаголовков стоял `group(8)`, и зазор до карточки выходил 28 pt
+            // вместо обычных 10: заголовок отрывался от своего блока и читался ничьим. В «Общих»,
+            // «Автозамене» и «Переводе» прокладки под заголовком нет, теперь и здесь так же.
             sectionTitle(L10n.t("voice.grpMic")),
-            group(8),
             // B. Всё про устройство ввода в одном месте: выбор, прогрев и его окно, системный уровень.
             card([
                 controlRow(L10n.t("voice.mic"), micSelectorControl(), key: "voice.mic"),
@@ -3184,7 +3530,6 @@ final class DetailVC: NSViewController {
             ]),
             group(6),
             sectionTitle(L10n.t("voice.grpDictation")),
-            group(8),
             // C. Поведение самой диктовки. Наш звук записи живёт ЗДЕСЬ, а системный уровень входа —
             // в карточке микрофона: два разных смысла разведены по разным карточкам.
             card([
@@ -3237,7 +3582,6 @@ final class DetailVC: NSViewController {
         views.append(contentsOf: [
             group(6),
             sectionTitle(L10n.t("voice.modelsTitle")),
-            group(8),
             modelCard
         ])
         // «Другие модели» — СРАЗУ за двумя рекомендованными, до пояснений: это продолжение списка,
@@ -3265,10 +3609,21 @@ final class DetailVC: NSViewController {
         #if !arch(arm64)
         views.append(contentsOf: [hint(L10n.t("voice.intelNote")), group(6)])
         #endif
+        // Выгрузка после каждой диктовки (просьба пользователей, автор 24.09.2026). Стоит в группе
+        // моделей, потому что это про модель, а не про саму диктовку. Подпись сразу говорит, кому
+        // она НЕ нужна: у большинства памяти хватает, и им галочка только добавит задержку.
+        #if arch(arm64)
+        let unloadSub = L10n.t("voice.unloadAfterSub")
+        #else
+        let unloadSub = L10n.t("voice.unloadAfterSubIntel")
+        #endif
+        views.append(card([
+            switchRow(L10n.t("voice.unloadAfter"), unloadSub, settings.voiceUnloadAfterDictation,
+                      #selector(toggleUnloadAfterDictation), help: L10n.t("voice.unloadAfterHelp"), key: "voice.unloadAfter"),
+        ]))
         views.append(contentsOf: [
             group(6),
             sectionTitle(L10n.t("voice.grpDuck")),
-            group(8),
             card([
                 switchRow(L10n.t("voice.duck"), L10n.t("voice.duckSub"), settings.voiceDuck,
                           #selector(toggleDuck), help: L10n.t("voice.duckHelp"), key: "voice.duck"),
@@ -3277,7 +3632,6 @@ final class DetailVC: NSViewController {
             ]),
             group(6),
             sectionTitle(L10n.t("voice.grpHistory")),
-            group(8),
             card([
                 switchRow(L10n.t("voice.history"), L10n.t("voice.historySub"), settings.voiceHistoryEnabled, #selector(toggleVoiceHistory),
                           key: "voice.history"),
@@ -3295,6 +3649,11 @@ final class DetailVC: NSViewController {
                 // остаётся ПОСЛЕ.
                 switchRow(L10n.t("voice.saveAudio"), L10n.t("voice.saveAudioSub"), settings.voiceSaveAudio,
                           #selector(toggleSaveAudio), help: L10n.t("voice.saveAudioHelp"), key: "voice.saveAudio"),
+                // Вставка последней диктовки по сочетанию (задача 242). Стоит в истории, а не в
+                // «Микрофоне»: вставляется именно ЗАПИСЬ ИЗ ИСТОРИИ, с её же сроком хранения и её
+                // же паролем. Соседство со «Скопировать последнюю диктовку» тут не случайно —
+                // это второй способ добраться до того же текста, только без похода в строку меню.
+                ] + pasteDictationRows() + [
                 buttonRow([histShow, histClear])
             ]),
             group(2),
@@ -3325,11 +3684,17 @@ final class DetailVC: NSViewController {
         let display: String
         let size: String
         let note: String
+        /// Ключ L10n для подсказки. Для whisper приходит из `ModelDownloader.catalog`, для Parakeet
+        /// это «voice.pkHelp». ⚠️ НЕ вычислять из id — почему, написано у `struct Model` в
+        /// `ModelDownloader`.
+        let helpKey: String
         /// Развёрнутое описание под кнопкой «i»: диск, память, скорость, для чего годится.
         /// Собирается из ключа модели и общего хвоста про память (`model.memNote`).
         var help: String {
-            let key = engine == "parakeet" ? "voice.pkHelp" : "model.\(id.hasPrefix("large") ? "large" : id).help"
-            let body = L10n.t(key)
+            let body = L10n.t(helpKey)
+            // Ключа нет в словаре → L10n.t возвращает сам ключ, и человек прочитал бы в поповере
+            // «model.large-v3-turbo-q5_0.help». Ловим это при добавлении модели, а не по отзыву.
+            assert(body != helpKey, "нет перевода для \(helpKey) — добавь пару ru/en")
             return body.contains("%@") ? String(format: body, L10n.t("model.memNote")) : body
         }
         func isInstalled() -> Bool {
@@ -3342,11 +3707,12 @@ final class DetailVC: NSViewController {
         var list: [UnifiedModel] = []
         #if arch(arm64) && !KEYBOOP_NO_PARAKEET   // Intel: Parakeet физически отсутствует в сборке (нет Neural Engine) — не дразним
         list.append(UnifiedModel(engine: "parakeet", id: "parakeet",
-                                 display: L10n.t("voice.pkName"), size: L10n.size("~465 MB"), note: L10n.t("voice.pkDesc")))
+                                 display: L10n.t("voice.pkName"), size: L10n.size("~465 MB"),
+                                 note: L10n.t("voice.pkDesc"), helpKey: "voice.pkHelp"))
         #endif
         list += ModelDownloader.catalog.map {
             UnifiedModel(engine: "whisper", id: $0.name, display: Self.whisperDisplayName($0.name),
-                         size: L10n.size($0.size), note: L10n.t($0.note))
+                         size: L10n.size($0.size), note: L10n.t($0.note), helpKey: $0.help)
         }
         return list
     }
@@ -4334,7 +4700,41 @@ final class DetailVC: NSViewController {
     }
     @objc private func toggleVoice(_ s: NSSwitch) { settings.voiceEnabled = (s.state == .on) }
     @objc private func voiceModeChanged(_ s: NSSegmentedControl) { settings.voiceHoldMode = s.selectedSegment == 1 ? "toggle" : "hold" }
-    @objc private func toggleVoiceHistory(_ s: NSSwitch) { settings.voiceHistoryEnabled = (s.state == .on) }
+    @objc private func toggleVoiceHistory(_ s: NSSwitch) {
+        settings.voiceHistoryEnabled = (s.state == .on)
+        // Без истории буфер не пишем. Зависимая строка живёт в «Общих» и перестроится при показе
+        // раздела, поэтому перерисовывать текущий раздел (и сбрасывать прокрутку) незачем.
+        ClipboardWatcher.shared.apply()
+    }
+    /// Захват буфера (задача 228). Выключение сразу останавливает новые записи; судьбу уже
+    /// собранных решает человек: тумблер не удаляет ничего молча, промах пальцем не стоит
+    /// истории, но и «выключил, а оно лежит» без вопроса не оставляем.
+    @objc private func toggleClipboardHistory(_ s: NSSwitch) {
+        settings.clipboardHistoryEnabled = (s.state == .on)
+        ClipboardWatcher.shared.apply()
+        guard s.state == .off else { return }
+        let n = VoiceHistory.shared.clipboardCount
+        guard n > 0 else { return }
+        let a = NSAlert()
+        a.messageText = String(format: L10n.t("gen.clipOff.title"), n)
+        a.informativeText = L10n.t("gen.clipOff.msg")
+        a.addButton(withTitle: L10n.t("gen.clipOff.keep"))
+        let del = a.addButton(withTitle: L10n.t("gen.clipOff.delete"))
+        del.hasDestructiveAction = true
+        if let w = view.window {
+            a.beginSheetModal(for: w) { r in
+                if r == .alertSecondButtonReturn { VoiceHistory.shared.removeClipboardEntries() }
+            }
+        } else if a.runModal() == .alertSecondButtonReturn {
+            VoiceHistory.shared.removeClipboardEntries()
+        }
+    }
+    /// Включили — модель уходит из памяти сразу, не дожидаясь следующей диктовки. Выключили —
+    /// греем её обратно, иначе первая диктовка после этого заплатила бы за загрузку зря.
+    @objc private func toggleUnloadAfterDictation(_ s: NSSwitch) {
+        settings.voiceUnloadAfterDictation = (s.state == .on)
+        VoiceController.shared.applyUnloadSetting()
+    }
     /// ⚠️ ВЫКЛЮЧЕНИЕ УНОСИТ УЖЕ ЗАПИСАННОЕ. Оставить клипы лежать после того, как человек снял
     /// галочку «сохранять запись голоса», значит соврать ему тумблером: он думает, что записей больше
     /// нет, а на диске остаются часы его речи. Сами тексты истории при этом не трогаем.
@@ -4356,19 +4756,51 @@ final class DetailVC: NSViewController {
             HistoryGate.promptDisable { ok in s.state = ok ? .off : .on }
         }
     }
-    // Значения в МИНУТАХ: 30, 60, 120, 240, 480, 0 (без удаления)
-    private let retentionMins = [30, 60, 120, 240, 480, 0]
+    // Значения в МИНУТАХ, список и порядок держит `HistoryPolicy.retentionMenu` (0 = без удаления).
+    // Минуты лежат в `tag` пункта, а не в параллельном массиве: у человека со старым вариантом
+    // (2 или 4 часа) в списке на один пункт больше, и индексы разъехались бы.
     private func historyRetentionControl() -> NSView {
         let pop = NSPopUpButton()
-        pop.addItems(withTitles: [L10n.t("ret.30m"), L10n.t("ret.1h"), L10n.t("ret.2h"), L10n.t("ret.4h"), L10n.t("ret.8h"), L10n.t("ret.never")])
-        let cur = settings.voiceHistoryMinutes
-        pop.selectItem(at: retentionMins.firstIndex(of: cur) ?? 1)
+        fillRetention(pop)
         pop.target = self; pop.action = #selector(retentionChanged(_:))
         return pop
     }
+    private func fillRetention(_ pop: NSPopUpButton) {
+        let cur = settings.voiceHistoryMinutes
+        pop.removeAllItems()
+        for mins in HistoryPolicy.retentionMenu(current: cur) {
+            pop.addItem(withTitle: L10n.retentionTitle(mins))
+            pop.lastItem?.tag = mins
+        }
+        pop.selectItem(withTag: cur)
+    }
+    /// ⚠️ СОКРАЩЕНИЕ СРОКА СПРАШИВАЕТ (ревью 24.09.2026). Новый срок применяется сразу, и всё, что
+    /// старше него, уходит насовсем вместе с записью голоса. Пока история держала 50 диктовок, это
+    /// было терпимо; с 7 и 30 днями и потолком 3000 промах мышью на соседний пункт стирал бы месяц.
+    /// Правило то же, что у выключения захвата буфера: промах пальцем не стоит истории. Первая
+    /// кнопка, то есть Return, оставляет всё как было.
     @objc private func retentionChanged(_ s: NSPopUpButton) {
-        settings.voiceHistoryMinutes = retentionMins[s.indexOfSelectedItem]
-        VoiceHistory.shared.applyRetention()
+        guard let mins = s.selectedItem?.tag else { return }
+        let old = settings.voiceHistoryMinutes
+        let apply = { [weak self] in
+            guard let self else { return }
+            self.settings.voiceHistoryMinutes = mins
+            VoiceHistory.shared.applyRetention()
+            self.fillRetention(s)   // старый пункт «2 часа» исчезает, как только выбран другой
+        }
+        let shorter = mins > 0 && (old == 0 || mins < old)
+        let n = shorter ? VoiceHistory.shared.countOlder(thanMinutes: mins) : 0
+        guard n > 0 else { apply(); return }
+        let a = NSAlert()
+        a.messageText = String(format: L10n.t("voice.retShrink.title"), n)
+        a.informativeText = L10n.t("voice.retShrink.msg")
+        a.addButton(withTitle: L10n.t("voice.retShrink.keep"))
+        let del = a.addButton(withTitle: L10n.t("voice.retShrink.delete"))
+        del.hasDestructiveAction = true
+        let done: (NSApplication.ModalResponse) -> Void = { [weak self] r in
+            if r == .alertSecondButtonReturn { apply() } else { self?.fillRetention(s) }
+        }
+        if let w = view.window { a.beginSheetModal(for: w, completionHandler: done) } else { done(a.runModal()) }
     }
     private let warmSecondsOptions = [15, 30, 60, 120, 300]   // 10 мин убрано — слишком долго держать HAL
     private func warmDurationControl() -> NSView {

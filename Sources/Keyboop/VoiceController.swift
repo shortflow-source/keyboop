@@ -146,6 +146,15 @@ final class VoiceController {
         // платил бы ПЕРВЫЙ buildEngine на main. Только lookup — capture-объектов не создаёт, TCC-промпт
         // не триггерит (инвариант «ничего до requestAccess» цел).
         DispatchQueue.global(qos: .utility).async { _ = AVCaptureDevice.default(for: .audio) }
+        // Человек сам попросил не держать модель в памяти между диктовками: прогрев со старта
+        // положил бы её туда до первой же диктовки, то есть сделал бы ровно то, от чего он отказался.
+        if settings.voiceUnloadAfterDictation {
+            kbLog("voice: прогрев модели пропущен — включена выгрузка после каждой диктовки")
+            // Сюда же приходят после скачивания модели (activateModel): скачивание само оставляет
+            // Parakeet загруженным, и без этой строки он висел бы до первой диктовки.
+            releaseModelsNow()
+            return
+        }
         // Греем ТОТ движок, которым реально пойдёт диктовка.
         // Parakeet раньше не грелся вообще, хотя он движок ПО УМОЛЧАНИЮ: его CoreML-модель грузится
         // и компилируется под ANE лениво, при первой транскрипции — замер 21.07 на чистом контейнере:
@@ -240,6 +249,12 @@ final class VoiceController {
             // сама очередь. Параллельно: старт мгновенный, загрузка прячется под время речи.
             if !willUseParakeet {
                 transcribeQueue.async { [weak self] in self?.loadModelIfNeeded() }
+            } else if !ParakeetEngine.shared.ready {
+                // Тот же приём для Parakeet (24.09.2026): холодная модель начинает грузиться на
+                // нажатии, а не после отпускания, и загрузка прячется под время речи. Раньше холодной
+                // она бывала только после смены движка на ходу, а с выгрузкой после каждой диктовки
+                // холодна КАЖДАЯ диктовка. Двойной загрузки не будет: `loadIfNeeded` ждёт уже идущую.
+                Task { _ = await ParakeetEngine.shared.loadIfNeeded() }
             }
             if abortStart { VoiceGate.set(false); setState(.idle); return }
             // ⚠️ УРОВЕНЬ ВХОДА ПОДНИМАЕМ ЗДЕСЬ, А НЕ В setState(.recording): тот вызывается уже ПОСЛЕ
@@ -284,6 +299,10 @@ final class VoiceController {
         if streamingActive { streamEnd(); return }   // потоковый путь: финализируем стрим
         noteSendGesture()         // правый ⌘ в момент отпускания = «отправить» (задача 124)
         let samples = recorder.stop()
+        // Отсчёт «сколько человек ждал»: от отпускания клавиши до текста в поле. Время самого
+        // whisper пишет WhisperBridge, но оно отвечает лишь за часть ожидания, а спрашивают всегда
+        // про всё ожидание целиком.
+        stopStamp = CFAbsoluteTimeGetCurrent()
         VoiceGate.set(false)      // ЗАПИСЬ окончена → можно сразу начинать НОВУЮ (транскрипция идёт в фоне)
         playCue(stopSound)    // нисходящее «тук-тук» — запись остановлена (до транскрипции)
         let rms = samples.isEmpty ? 0 : (samples.map { $0 * $0 }.reduce(0, +) / Float(samples.count)).squareRoot()
@@ -352,8 +371,43 @@ final class VoiceController {
                 // языка в настройках для этого движка не делал НИЧЕГО. Он и сейчас не выбирает
                 // язык (модель этого не умеет), но включает фильтр по письменности — см. подробный
                 // комментарий в ParakeetEngine.transcribe.
-                let text = ok ? await ParakeetEngine.shared.transcribe(samples: samples, language: lang) : ""
-                kbLog("voice: parakeet(готов=\(ok), язык=\(lang)) → \(text.count) симв.")
+                let out = ok ? await ParakeetEngine.shared.transcribe(samples: samples, language: lang) : nil
+                var text = out ?? ""
+                kbLog("voice: parakeet(готов=\(ok), язык=\(lang)) → \(out.map { "\($0.count) симв." } ?? "ОТКАЗ")")
+                // ⚠️ ОТКАЗ ДВИЖКА → ДОКАНЧИВАЕМ ЗАПИСЬ ВТОРЫМ ДВИЖКОМ, А НЕ ОТДАЁМ ПУСТОТУ.
+                // Отзыв #161 (21.08.2026): у человека на macOS 14 модель Parakeet падала в CoreML на
+                // КАЖДОЙ диктовке («Encoder_main__Op8_Cast has timed out»), и все девять часов он
+                // видел только «Распознаю» и пустоту после. Записанный звук при этом целый, второй
+                // движок у нас есть, и молчать в такой ситуации нечем оправдать.
+                // Настройку человека НЕ трогаем: движок остаётся выбранным, подменяем только эту
+                // попытку. Выбор движка это его решение, а не наше.
+                if out == nil {
+                    // ⚠️ ВТОРАЯ МОДЕЛЬ МОЖЕТ БЫТЬ ПРОСТО НЕ СКАЧАНА, и тогда «подмена» это та же
+                    // тишина этажом ниже (замечание автора 21.08). Whisper весит от 466 МБ до 1.6 ГБ,
+                    // тянуть их за человека без спроса нельзя: это его трафик и его диск.
+                    if await MainActor.run(body: { self.modelInstalled }) {
+                        text = await withCheckedContinuation { (c: CheckedContinuation<String, Never>) in
+                            self.transcribeQueue.async { [weak self] in
+                                guard let self else { return c.resume(returning: "") }
+                                self.loadModelIfNeeded()
+                                let t = self.whisper?.transcribe(samples: samples, language: lang) ?? ""
+                                kbLog("voice: parakeet отказал — доканчиваю whisper'ом, \(t.count) симв.")
+                                c.resume(returning: t)
+                            }
+                        }
+                    } else {
+                        kbLog("voice: parakeet отказал, а модели Whisper на диске нет — говорю человеку")
+                    }
+                    // ⚠️ ОДИН РАЗ ЗА ЗАПУСК, А НЕ НА КАЖДУЮ ДИКТОВКУ. Отказ этот постоянный (зависит
+                    // от версии macOS), и тост на каждую фразу превратился бы в травлю. Но сказать
+                    // ОДИН раз обязательно: подмена молча делает распознавание в разы медленнее, и
+                    // человек имеет право знать, почему.
+                    if !Self.parakeetFallbackTold {
+                        Self.parakeetFallbackTold = true
+                        let key = text.isEmpty ? "voice.parakeetNoAlt" : "voice.parakeetFell"
+                        await MainActor.run { VoiceIndicator.shared.showToast(L10n.t(key)) }
+                    }
+                }
                 // Кодируем и шифруем ЗДЕСЬ, в фоне, а не в deliver: тот работает на главном потоке,
                 // где живёт runloop нашего event-tap, и подмораживать его ради AAC нельзя (цену этого
                 // мы уже платили на startRunning, см. AudioRecorder).
@@ -362,6 +416,10 @@ final class VoiceController {
                     guard self.endTranscription(gen) else { clip.map { VoiceClips.delete($0.id) }; return }   // сторож уже бросил — поздний результат в топку
                     self.deliver(text, historyOnly: self.historyOnlyGens.remove(gen) != nil, audio: clip?.id, wave: clip?.wave)
                     self.refreshIndicator()
+                    // Выгрузка после диктовки, если человек её включил. Без настройки это ещё и
+                    // заводит таймер простоя для Whisper, если он понадобился как запасной движок:
+                    // раньше такой запасной Whisper оставался в памяти насовсем.
+                    self.scheduleModelRelease()
                 }
             }
             return
@@ -424,6 +482,18 @@ final class VoiceController {
     /// Считаем по МНОЖЕСТВАМ, а не по счётчику: пока молчаливая расшифровка считается, человек уже
     /// мог начать обычную диктовку, и её плашку прятать нельзя. Плашка нужна, только если есть хотя
     /// бы одна живая расшифровка, которую ждут в поле.
+    /// Идёт ли ПРЯМО СЕЙЧАС запись или расшифровка, результат которой ждут в поле.
+    ///
+    /// Условие дословно то же, что у плашки (`refreshIndicator`), и это не совпадение: «плашка
+    /// висит» и «результата ещё нет» — одно и то же состояние. Нужен вставке последней диктовки
+    /// (задача 242): свежая запись ложится в историю ПОСЛЕ доставки текста, поэтому во время
+    /// записи и расшифровки `lastVisible()` отдаёт ПРЕДЫДУЩУЮ диктовку — хоткей вставил бы вчерашний
+    /// текст, а через секунду в то же поле приехал бы свежий, и человек разбирал бы склейку.
+    /// ⚠️ Только с главного потока: `liveTranscriptions` main-only.
+    var isBusyWithDictation: Bool {
+        recorder.isRecording || liveTranscriptions.contains(where: { !historyOnlyGens.contains($0) })
+    }
+
     private func refreshIndicator() {
         if recorder.isRecording { setState(.recording) }
         else if liveTranscriptions.contains(where: { !historyOnlyGens.contains($0) }) { setState(.processing) }
@@ -574,14 +644,18 @@ final class VoiceController {
                 self.streamStep(final, commit: true)           // ЕДИНСТВЕННОЕ место, где стрим печатает
                 let clean = self.typedTail.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !clean.isEmpty {
-                    if TextReplacer.secureInputActive {
+                    if !SecureInputPolicy.canWrite("хвост стриминга") {
                         // Финал пришёлся на поле пароля: хвост не досылаем (streamStep выше уже
                         // пропущен гвардом в TextReplacer), текст сохраняем и честно говорим.
                         kbLog("voice: secure input на финале стриминга — текст в истории")
                         VoiceIndicator.shared.showToast(L10n.t("voice.securePwd"))
                     } else {
+                        // Время НАЧАЛА вставки едет вместе с сообщением: получатель по нему поймёт,
+                        // печатал ли человек ПОСЛЕ нас (см. наблюдателя в Engine).
+                        let insertT0 = ProcessInfo.processInfo.systemUptime
                         TextReplacer.insert(" ") {                  // пробел в конце, как в батч-deliver()
-                            NotificationCenter.default.post(name: .keyboopVoiceInserted, object: nil)
+                            NotificationCenter.default.post(name: .keyboopVoiceInserted, object: nil,
+                                                            userInfo: ["startedAt": insertT0])
                         }
                     }
                     VoiceHistory.shared.add(clean, audio: clip?.id, wave: clip?.wave)  // в историю — ОДИН раз, на финале
@@ -664,6 +738,14 @@ final class VoiceController {
         case .idle:
             SystemVolume.restore()
             VoiceIndicator.shared.hide()
+            // Выгрузка после диктовки ловится ЗДЕСЬ, а не только в конце доставки текста (ревью
+            // 24.09): у записи много выходов без расшифровки — слишком короткое нажатие, тишина,
+            // Escape, смерть устройства, прерванный старт, брошенная сторожем расшифровка. Модель
+            // к тому моменту уже грузилась с нажатия, и без этой строки оставалась бы в памяти.
+            // На следующий такт: флаги активности снимаются рядом с этим вызовом, пусть осядут.
+            if settings.voiceUnloadAfterDictation {
+                DispatchQueue.main.async { [weak self] in self?.releaseModelsNow() }
+            }
         }
     }
 
@@ -703,9 +785,8 @@ final class VoiceController {
     ///
     /// Точку снимаем ТОЛЬКО одиночную в самом конце и только её: «...» и «?»/«!» не трогаем, они
     /// несут смысл, а многоточие вдобавок часто ставит сама модель на оборванной фразе.
-    /// Регистр опускаем ТОЛЬКО у первой буквы и только если вторая — строчная: иначе аббревиатуры
-    /// («МФЦ», «ГОСТ») превратились бы в «мФЦ». Это тот случай, где «умное» правило без оговорки
-    /// портит редкий, но заметный ввод.
+    /// Регистр опускаем только у первой буквы предложения; имена, аббревиатуры и намеренный регистр
+    /// словаря диктовки защищает `VoiceOutputCase`.
     static func applyOutputOptions(_ text: String) -> String {
         let s = AppSettings.shared
         var out = text
@@ -722,64 +803,14 @@ final class VoiceController {
         return out
     }
 
-    /// Снять заглавную у первой буквы КАЖДОГО предложения.
-    ///
-    /// До 10.08.2026 правило доставало ровно одну букву, самую первую во всей диктовке (отзыв
-    /// автора): «привет. Как дела» вместо «привет. как дела». Диктуют обычно не одно предложение, так
-    /// что настройка работала на первой фразе и молча переставала на второй.
-    ///
-    /// Две оговорки, обе из-за того, что точка в тексте значит не только конец предложения:
-    ///
-    /// • **Аббревиатуры.** Если следом за первой буквой идёт ещё одна заглавная, слово не трогаем,
-    ///   иначе «МФЦ» стало бы «мФЦ». Это правило было и раньше, оно просто применялось один раз.
-    /// • **Сокращения с точкой.** «г. Москва», «ул. Ленина», «т. д.» это НЕ конец предложения, и
-    ///   опускать там регистр значит портить текст заметнее, чем недоработать. Список закрытый и
-    ///   намеренно короткий: расширять его до каталога всех сокращений языка бессмысленно, а вот
-    ///   держать в нём десяток самых частых дёшево и полезно.
-    private static let notSentenceEnd: Set<String> = [
-        "г", "гг", "д", "др", "е", "им", "каб", "корп", "кв", "млн", "млрд", "обл", "оф", "п", "пр",
-        "проф", "рис", "руб", "с", "см", "стр", "т", "тел", "тыс", "ул", "эт",
-        "mr", "mrs", "ms", "dr", "prof", "vs", "fig", "no", "etc", "e", "g", "i"
-    ]
-
+    /// Чистая production-логика живёт отдельно и тем же файлом линкуется в VoiceCaseSim. Здесь
+    /// остаётся только проводка пользовательского словаря, который знает намеренный регистр слов.
     static func lowercasedSentenceStarts(_ text: String) -> String {
-        var ch = Array(text)
-        var atStart = true          // ждём первую букву предложения
-        var word = ""               // слово, которое сейчас набирается (нужно только перед точкой)
-        for i in 0..<ch.count {
-            let c = ch[i]
-            if c.isLetter || c.isNumber {
-                if atStart, c.isUppercase {
-                    let next = i + 1 < ch.count ? ch[i + 1] : nil
-                    // ⚠️ ТРЕТЬЯ ОГОВОРКА: слова из словаря диктовки. Человек написал «Keyboop» с
-                    // большой буквы осознанно, и «не начинать с заглавной» про обычные предложения,
-                    // а не про имена. Без этого словарь чинил бы слово ровно до тех пор, пока оно не
-                    // окажется первым в предложении.
-                    var j = i, w = ""
-                    while j < ch.count, ch[j].isLetter || ch[j].isNumber { w.append(ch[j]); j += 1 }
-                    if !(next?.isUppercase ?? false), !VoiceDictionary.shared.keepsCase(w) {
-                        ch[i] = Character(c.lowercased())
-                    }
-                }
-                atStart = false
-                word.append(c)
-                continue
-            }
-            switch c {
-            case ".":
-                // Точка после сокращения предложение не закрывает.
-                atStart = !Self.notSentenceEnd.contains(word.lowercased())
-            case "!", "?", "…", "\n", "\r":
-                atStart = true
-            case " ", "\t", "«", "\"", "“", "(", "[", "-", "—", ":", ";", ",":
-                break               // не сбивают признак начала и сами его не ставят
-            default:
-                atStart = false
-            }
-            word = ""
-        }
-        return String(ch)
+        VoiceOutputCase.lowercasedSentenceStarts(text, keepsCase: VoiceDictionary.shared.keepsCase)
     }
+
+    /// Когда закончилась запись. Нужно только для строки «ожидание=…мс» в логе.
+    private var stopStamp: CFAbsoluteTime?
 
     private func deliver(_ text: String, historyOnly: Bool = false, audio: String? = nil, wave: [UInt8]? = nil) {
         // Фразы-призраки Whisper («Субтитры создавал…», «Продолжение следует») — отсекаем ДО всего
@@ -813,8 +844,8 @@ final class VoiceController {
         }
         // Поле пароля/системный диалог украли фокус (инцидент 23.07.2026): печатать нельзя,
         // но распознанное НЕ теряем — история + честный тост вместо молчаливой пропажи.
-        if TextReplacer.secureInputActive {
-            kbLog("voice: активен secure input — не печатаю \(clean.count) симв., текст в истории")
+        if !SecureInputPolicy.canWrite("диктовка \(clean.count) симв.") {
+            kbLog("voice: писать нельзя — не печатаю \(clean.count) симв., текст в истории")
             VoiceHistory.shared.add(clean, audio: audio, wave: wave)
             noteVoiceStats(clean)
             VoiceIndicator.shared.showToast(L10n.t("voice.securePwd"))
@@ -825,6 +856,10 @@ final class VoiceController {
         // движке. Корень исследован (whisper «no-punctuation mode» / Parakeet не эмитит знак-токены на
         // тихих хвостах). Коррелировать с длительностью/noSpeechMax из строк выше.
         let punct = clean.reduce(0) { $0 + (".,!?;:…—–".contains($1) ? 1 : 0) }
+        if let t0 = stopStamp {
+            kbLog("voice: ожидание от конца записи до текста \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))мс")
+            stopStamp = nil
+        }
         kbLog("voice: распознано \(clean.count) симв., пунктуация=\(punct)")
         noteVoiceStats(clean)
         // Пробел в конце — чтобы следующая фраза не слиплась с этой (предложил пользователь).
@@ -839,9 +874,13 @@ final class VoiceController {
         let autoEnter = settings.voiceAutoEnter || sendGestureArmed
         sendGestureArmed = false
         let out = Self.applyOutputOptions(clean) + ((settings.voiceTrailingSpace && !autoEnter) ? " " : "")
+        // См. второй post ниже по файлу: время НАЧАЛА вставки нужно получателю, чтобы отличить
+        // «человек ещё ничего не печатал» от «человек уже набрал слово, пока мы печатали своё».
+        let insertT0 = ProcessInfo.processInfo.systemUptime
         TextReplacer.insert(out, thenReturn: autoEnter,
                             returnMods: CGEventFlags(rawValue: settings.voiceAutoEnterMods)) {
-            NotificationCenter.default.post(name: .keyboopVoiceInserted, object: nil)
+            NotificationCenter.default.post(name: .keyboopVoiceInserted, object: nil,
+                                            userInfo: ["startedAt": insertT0])
         }
         VoiceHistory.shared.add(clean, audio: audio, wave: wave)
     }
@@ -855,6 +894,9 @@ final class VoiceController {
     }
 
     /// Отложенная выгрузка модели Whisper из памяти (см. scheduleModelRelease).
+    /// Сказали ли мы уже про отказ Parakeet. Статический: живёт до конца запуска, см. место вызова.
+    private static var parakeetFallbackTold = false
+
     private var modelIdleRelease: DispatchWorkItem?
 
     private func loadModelIfNeeded() {
@@ -874,6 +916,7 @@ final class VoiceController {
     /// Выгружаем ТОЛЬКО когда реально простаиваем: идёт запись/транскрипция → откладываем.
     private func scheduleModelRelease() {
         modelIdleRelease?.cancel(); modelIdleRelease = nil
+        if settings.voiceUnloadAfterDictation { releaseModelsNow(); return }
         let minutes = settings.voiceModelIdleMinutes
         guard minutes > 0, whisper != nil else { return }
         let work = DispatchWorkItem { [weak self] in
@@ -890,8 +933,88 @@ final class VoiceController {
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(minutes) * 60, execute: work)
     }
 
+    /// Настройку выгрузки переключили в окне настроек: включили — выгрузить сейчас, выключили —
+    /// прогреть модель обратно, как на старте.
+    func applyUnloadSetting() {
+        if settings.voiceUnloadAfterDictation { releaseModelsNow() } else { preload() }
+    }
+
+    /// Выгрузка «после каждой диктовки» (настройка, 24.09.2026): обе модели уходят из памяти сразу,
+    /// как только мы простаиваем.
+    ///
+    /// ⚠️ ТОЛЬКО В ПРОСТОЕ. Если человек уже зажал следующую диктовку, её модель грузится прямо
+    /// сейчас, и выгрузить её значило бы заставить ту диктовку ждать второй загрузки. Такую диктовку
+    /// выгрузит её собственный конец. Импорт файла идёт кусками, и между кусками модель тоже не
+    /// трогаем: иначе часовой файл перезагружал бы её сотню раз, а `importFinished` выгрузит в конце.
+    ///
+    /// ⚠️ ЗАПИСЬ ЗВОНКА ТОЖЕ ДЕРЖИТ МОДЕЛЬ (`CallRecorder.isBusy`, ревью 24.09): её куски идут через
+    /// тот же `transcribeImported` прямо во время звонка, и выгрузка после случайной диктовки
+    /// заставляла бы следующий кусок грузить модель заново.
+    ///
+    /// ⚠️ ЕСЛИ PARAKEET КАК РАЗ ГРУЗИТСЯ, выгрузить его нельзя, и молча сдаваться тоже нельзя. Так
+    /// бывает при коротком случайном нажатии: загрузка стартовала на нажатии, диктовки не
+    /// случилось, и без повтора 465 МБ висели бы до следующей настоящей диктовки. Ждём конца
+    /// загрузки и пробуем снова; если к тому моменту началась новая диктовка, проверка простоя
+    /// выше отложит выгрузку до её конца.
+    private func releaseModelsNow() {
+        guard transcribing == 0, !isActive, !recorder.isRecording, !starting,
+              !AudioImporter.shared.isRunning, !CallRecorder.shared.isBusy else { return }
+        transcribeQueue.async { [weak self] in
+            guard let self, self.whisper != nil else { return }
+            self.whisper = nil                   // deinit → whisper_free
+            kbLog("voice: модель Whisper выгружена после диктовки (настройка)")
+        }
+        if !ParakeetEngine.shared.unload() {
+            Task { [weak self] in
+                await ParakeetEngine.shared.waitForPendingLoad()
+                // Тот, кто начал загрузку, снимает свою пометку «гружу» чуть позже, чем её
+                // дожидаются остальные; без паузы повтор мог бы крутиться вхолостую.
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                await MainActor.run {
+                    guard let self, self.settings.voiceUnloadAfterDictation else { return }
+                    self.releaseModelsNow()
+                }
+            }
+        }
+    }
+
     /// Язык для whisper — из настроек (по умолчанию язык ОС, НЕ раскладки). "auto" → whisper определит.
     private func languageForWhisper() -> String { settings.voiceLanguage }
+
+    // MARK: - Импорт файла (задача 229)
+
+    /// Расшифровать кусок импортированного файла тем же движком, что и диктовку. nil — модели нет
+    /// или движок отказал. Whisper строго по одному на `transcribeQueue`, поэтому диктовка и импорт
+    /// не пересекаются внутри `whisper_full`; Parakeet — actor. Каждый кусок продлевает «человек
+    /// работает» для выгрузки модели по давлению памяти и снимает таймер выгрузки по простою:
+    /// иначе посреди часового файла модель уехала бы из памяти и вернулась через секунду-две.
+    func transcribeImported(_ samples: [Float]) async -> String? {
+        let lang = languageForWhisper()
+        let useParakeet = settings.voiceEngine == "parakeet" && ParakeetEngine.modelInstalled
+        await MainActor.run {
+            self.lastVoiceUseAt = Date()
+            self.modelIdleRelease?.cancel(); self.modelIdleRelease = nil
+        }
+        if useParakeet {
+            if await ParakeetEngine.shared.loadIfNeeded(),
+               let t = await ParakeetEngine.shared.transcribe(samples: samples, language: lang) { return t }
+            kbLog("импорт: parakeet отказал — пробую whisper")
+        }
+        guard await MainActor.run(body: { self.modelInstalled }) else { return nil }
+        return await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
+            transcribeQueue.async { [weak self] in
+                guard let self else { return c.resume(returning: nil) }
+                self.loadModelIfNeeded()
+                guard let w = self.whisper else { return c.resume(returning: nil) }
+                c.resume(returning: w.transcribe(samples: samples, language: lang))
+            }
+        }
+    }
+
+    /// Импорт закончился: вернуть модели обычный режим выгрузки по простою.
+    func importFinished() {
+        DispatchQueue.main.async { [weak self] in self?.scheduleModelRelease() }
+    }
 
     /// Синхронно освободить модель ПЕРЕД выходом из процесса (applicationWillTerminate).
     /// Swift не запускает deinit при exit(), поэтому без этого whisper_free не случался и Metal-буферы

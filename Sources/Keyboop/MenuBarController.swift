@@ -18,12 +18,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var waveTimer: Timer?
 
     var onOpenSettings: (() -> Void)?
+    /// Открыть настройки сразу на «Приватности» — туда ведёт строка про скрытый ввод.
+    var onOpenPrivacy: (() -> Void)?
     var onShowVoiceHistory: (() -> Void)?
     /// Старт диктовки из быстрого действия (задача 21).
     var onQuickDictate: (() -> Void)?
     var onToggleAuto: ((Bool) -> Void)?
     var onCheckUpdates: (() -> Void)?
     var onQuit: (() -> Void)?
+    /// ⌥-клик по значку: скрытая запись звонка (задача 230).
+    var onToggleCallRecording: (() -> Void)?
+    private var callRecording = false
     var needsPermission = false
     private var voiceState: VoiceController.State = .idle
 
@@ -74,44 +79,78 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     // MARK: - Выравнивание своих картинок по системной линии значков
 
-    /// ⚠️ РУЧНАЯ КАРТИНКА В СТРОКЕ МЕНЮ СИДИТ ВЫШЕ СИСТЕМНЫХ ЗНАЧКОВ, И ЭТО ВИДНО (отзыв #150,
-    /// «язык не выровнен по отношению к иконке», 18.08.2026).
+    /// ⚠️ ЗНАК И БУКВЫ ЯЗЫКА СТОЯЛИ НА РАЗНОЙ ВЫСОТЕ (отзыв #150 от 18.08.2026, повторно автор
+    /// 21.08.2026: «всё ещё криво»). Правка от 18.08 сделала хуже, и здесь записано почему.
     ///
-    /// Замер стендом (отдельный процесс с шестью пунктами разной постройки, скриншот строки меню,
-    /// центр чернил каждого значка посчитан по пикселям):
-    ///   • наш флаг и любая другая голая NSImage — центр 26.5 px;
-    ///   • значки соседей (SF Symbol и шаблонные картинки) — 29.0…30.0 px;
-    ///   • наши же буквы «RU» — 29.0 px.
-    /// То есть мы выше всех ровно на 3 px, это 1.5 pt. Причина не в размере картинки: все варианты
-    /// с разной высотой чернил сели в один и тот же центр 26.5. AppKit центрирует голую картинку по
-    /// кнопке пункта, а символам знает базовую линию и сажает их ниже. У картинки такой линии нет,
-    /// поэтому опускаем её сами.
+    /// ⛔️ ГЛАВНОЕ: ЗНАКУ НЕ НУЖНА НИКАКАЯ ПОПРАВКА, И ДОБАВЛЯТЬ ЕЁ НЕЛЬЗЯ. Замер живого
+    /// приложения 21.08.2026 (снимок строки меню, разбор по пикселям, ретина, 1 pt = 2 px,
+    /// геометрический центр рамки чернил): знак без поправки 29.5, буквы языка 29.0, системные
+    /// значки соседей 29.0…29.5. Расхождение полпикселя, глазу недоступно.
     ///
-    /// ⚠️ ЛЕЧИТЬ ИМЕННО КОРОБКОЙ, А НЕ РАЗМЕРОМ. Первым делом хочется уменьшить флаг, но замер это
-    /// опровергает: высота чернил на положение центра не влияет вовсе. И размер флага — отдельное
-    /// решение автора от 25.07 («чтобы флаг не выглядел мелким»), его трогать нельзя.
+    /// Две ошибки прошлой правки, обе стоит помнить.
+    ///
+    /// 1. **Мерили не ту величину.** Брали центр МАССЫ чернил, а у знака чернила это тонкая рамка
+    ///    с буквой внутри, у букв — сплошные штрихи. Для фигур разной плотности эта величина не
+    ///    сравнима: знак вышел «выше» текста, хотя на глаз был ниже. Сравнивать надо
+    ///    ГЕОМЕТРИЧЕСКИЙ центр, (верх + низ) / 2, именно его сопоставляет глаз.
+    ///
+    /// 2. **Поле вокруг картинки не сдвигает её, а пересчитывает.** Задумка была простая: дорисуем
+    ///    поле сверху, картинка опустится. На деле NSStatusItem подгоняет картинку под строку меню
+    ///    целиком, и добавленное поле меняет масштаб. Замер живого значка: без поправки высота
+    ///    чернил 28 px и центр 29.5; с полем в 1.5 pt центр уезжает на 32.0, то есть ВТРОЕ дальше
+    ///    от цели, чем было. А поправки в 0.5 и 0.75 pt дают ещё и замыленный край: поле в полтора
+    ///    пикселя сажает картинку на полупиксельную сетку, высота чернил вырастает с 28 до 32 px.
+    ///
+    /// Проверять только на ЖИВОМ приложении. Стенд `Tools/menubar-align-probe.swift` (несколько
+    /// пунктов разной постройки рядом) полезен, чтобы сравнить варианты между собой, но абсолютные
+    /// числа у него свои: та же картинка без поправки дала на стенде 30.5 против 29.5 в приложении.
+    /// Поэтому решение принимаем по снимку боевого значка, а стенд остаётся средством сравнения.
+
+    /// ⚠️ ФЛАГУ ПОПРАВКА ВСЁ-ТАКИ НУЖНА, И ЭТО НЕ ПРОТИВОРЕЧИЕ ПРЕДЫДУЩЕМУ. Он строится иначе:
+    /// обрезан ровно по глифу эмодзи, без собственных полей, поэтому садится выше знака. Замер на
+    /// стенде: флаг без поправки 28.0, с опусканием на 0.5 pt ровно 29.0, высота чернил 21 px в
+    /// обоих случаях, то есть замыливания нет (0.5 pt это ровно 1 px, полупиксельной сетки не
+    /// возникает).
+    ///
+    /// ⚠️ Число проверено СТЕНДОМ, а не боевым значком: у автора выбран режим «знак», а переключать
+    /// ему настройку ради замера нельзя. Если придёт жалоба на флаг — начинать со снимка живого
+    /// приложения в режиме флага, а не с подбора этой константы вслепую.
+    ///
+    /// ⚠️ PERSONAL: ПОПРАВКИ ЗАВИСЯТ ОТ ЭКРАНА (ветка personal, слияние с upstream 0.4.10).
+    /// Числа upstream выше сняты на его железе. На macOS 14.8.4 и MacBook Air M1 без выреза личная
+    /// сборка мерила своё: картинкам 0.5 pt вниз, тексту baseline −1 pt. Поэтому режим `.original`
+    /// повторяет upstream один в один (знак без поправки, флаг 0.5), а `.preLiquidGlassNotchless`
+    /// сохраняет личный замер. ⚠️ 0.5 для знака мерили на старом 15-pt знаке; после перехода на
+    /// 18-pt холст upstream нужен свежий снимок живого значка на этом железе.
+    ///
+    /// ⚠️ ЛЕЧИТЬ ИМЕННО КОРОБКОЙ, А НЕ РАЗМЕРОМ. Размер флага — отдельное решение автора от 25.07
+    /// («чтобы флаг не выглядел мелким»), его трогать нельзя.
     private enum MenuBarAlignment: Hashable {
         case original
         case preLiquidGlassNotchless
 
-        var imageDrop: CGFloat { self == .preLiquidGlassNotchless ? 0.5 : 1.5 }
+        /// Знак: upstream — без поправки (замер живого приложения 21.08.2026), личный замер — 0.5.
+        var brandDrop: CGFloat { self == .preLiquidGlassNotchless ? 0.5 : 0 }
+        /// Флаг: обрезан ровно по глифу и садится выше; 0.5 pt совпадает в обоих замерах.
+        var flagDrop: CGFloat { 0.5 }
+        var titleBaselineOffset: CGFloat { self == .preLiquidGlassNotchless ? -1 : 0 }
     }
 
     private var menuBarAlignment: MenuBarAlignment = .original
 
-    /// Поправка 0.5/-1 pt измерена на macOS 14.8.4 и MacBook Air M1 без выреза. На macOS 26
-    /// AppKit сменил оформление строки меню, а у экранов с камерой отличается её геометрия, поэтому
-    /// там сохраняем прежние 1.5/0 pt, пока не появится отдельный замер на таком железе.
+    /// Личный замер сделан на macOS 14.8.4 без выреза. На macOS 26 AppKit сменил оформление строки
+    /// меню, а у экранов с камерой другая её геометрия — там действует раскладка upstream.
     private static func alignment(for screen: NSScreen?) -> MenuBarAlignment {
         if #available(macOS 26.0, *) { return .original }
         guard let screen, screen.safeAreaInsets.top == 0 else { return .original }
         return .preLiquidGlassNotchless
     }
 
-    /// Опустить готовую картинку на величину выбранного режима, дорисовав поле сверху. Всё
-    /// остальное (шаблонность, подпись для VoiceOver) переносится как есть.
-    private static func dropped(_ img: NSImage, alignment: MenuBarAlignment) -> NSImage {
-        let drop = alignment.imageDrop
+    /// Опустить готовую картинку на `drop`, дорисовав поле сверху. Всё остальное (шаблонность,
+    /// подпись для VoiceOver) переносится как есть. drop = 0 — картинка без изменений (см. выше:
+    /// поле снаружи NSStatusItem пересчитывает, поэтому без нужды его не добавляем).
+    private static func dropped(_ img: NSImage, by drop: CGFloat) -> NSImage {
+        guard drop > 0 else { return img }
         let size = NSSize(width: img.size.width, height: img.size.height + drop * 2)
         let out = NSImage(size: size)
         out.lockFocus()
@@ -131,9 +170,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         // Сначала всегда задаём обычный title: это снимает attributed baseline, если строка меню
         // переехала на экран/ОС, где должна работать исходная раскладка AppKit.
         button.title = title
-        guard menuBarAlignment == .preLiquidGlassNotchless, !title.isEmpty else { return }
+        let offset = menuBarAlignment.titleBaselineOffset
+        guard offset != 0, !title.isEmpty else { return }
         let shifted = NSMutableAttributedString(attributedString: button.attributedTitle)
-        shifted.addAttribute(.baselineOffset, value: -1.0,
+        shifted.addAttribute(.baselineOffset, value: offset,
                              range: NSRange(location: 0, length: shifted.length))
         button.attributedTitle = shifted
     }
@@ -145,14 +185,21 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private static func brandStatusImage(alignment: MenuBarAlignment) -> NSImage? {
         if let cached = brandStatusImageCache[alignment] { return cached }
         guard let src = markImage else { return nil }
-        let h: CGFloat = 15, w = h * (src.size.width / max(src.size.height, 1))
-        let img = NSImage(size: NSSize(width: w, height: h))
+        // ⚠️ ТА ЖЕ ГЕОМЕТРИЯ, ЧТО У ЗНАКА В WAVEFORM (renderWave): холст 18 pt, знак 17 pt со
+        // сдвигом 0.5 внутри холста. До 04.09.2026 знак покоя был 15 pt: отзыв #242 («оторван от
+        // соседей») объяснился тем, что чернил в нём меньше, чем у обычных значков (17–18 pt), и
+        // воздуха вокруг больше; заодно при старте диктовки знак прыгал с 15 на 17. Сдвиг остаётся
+        // ВНУТРИ холста, а не полем снаружи: поле снаружи меняет размер картинки, а его NSStatusItem
+        // пересчитывает под строку меню (так прошлая правка увела знак втрое дальше от цели).
+        let H: CGFloat = 18, markS: CGFloat = 17
+        let w = markS * (src.size.width / max(src.size.height, 1))
+        let img = NSImage(size: NSSize(width: ceil(w), height: H))
         img.lockFocus()
-        src.draw(in: NSRect(x: 0, y: 0, width: w, height: h),
+        src.draw(in: NSRect(x: 0, y: (H - markS) / 2, width: w, height: markS),
                  from: .zero, operation: .sourceOver, fraction: 1)
         img.unlockFocus()
         img.isTemplate = true
-        let out = dropped(img, alignment: alignment)
+        let out = dropped(img, by: alignment.brandDrop)
         brandStatusImageCache[alignment] = out
         return out
     }
@@ -219,7 +266,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         img.unlockFocus()
         img.isTemplate = false
         img.accessibilityDescription = lang
-        let out = dropped(img, alignment: alignment)
+        let out = dropped(img, by: alignment.flagDrop)   // на общую линию с буквами
         flagCache[key] = out
         return out
     }
@@ -318,13 +365,35 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let lang = settings.menuBarShowLanguage ? code : ""
         let mark = (needsPermission || AppHealth.iconDimmed(health)) ? "⚠︎" : ""
         let parts = [lang, mark].filter { !$0.isEmpty }
+        let bare = settings.menuBarStyle == "hidden"
+        if callRecording {
+            // Красный кружок рядом со значком (задача 230): запись звонка нельзя забыть. Цвет тут
+            // допустим, потому что подсказка значка говорит то же самое словами.
+            let text = parts.joined(separator: " ")
+            let font = NSFont.menuBarFont(ofSize: 0)
+            let s = NSMutableAttributedString(string: (bare ? "" : " ") + (text.isEmpty ? "" : text + " "),
+                                              attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+            s.append(NSAttributedString(string: "●", attributes: [.font: font, .foregroundColor: NSColor.systemRed]))
+            button.attributedTitle = s
+            button.imagePosition = bare ? .noImage : .imageLeading
+            button.toolTip = L10n.t("call.tip")
+            return
+        }
         guard !parts.isEmpty else { button.title = ""; return }
         let text = parts.joined(separator: " ")
         // Без значка (hidden) подпись без ведущего пробела; со значком — с отступом от него.
-        setStatusTitle(settings.menuBarStyle == "hidden" ? text : " \(text)", on: button)
+        setStatusTitle(bare ? text : " \(text)", on: button)
     }
 
     /// Индикатор диктовки в статус-баре: запись / распознавание / покой.
+    /// Запись звонка (задача 230): красный кружок в строке меню, пока идёт запись. Во время диктовки
+    /// значок держит её индикатор, кружок вернётся вместе со значком покоя.
+    func setCallRecording(_ on: Bool) {
+        callRecording = on
+        shownIconState = nil          // подсказка значка перечитается на следующем тике
+        applyIconStyle()
+    }
+
     func setVoiceState(_ s: VoiceController.State) {
         voiceState = s
         guard let button = statusItem.button else { return }
@@ -479,7 +548,21 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func statusItemClicked() {
         // ⌃-клик система штатно считает правым, и человек с трекпадом часто именно им и пользуется.
         let e = NSApp.currentEvent
-        let right = e?.type == .rightMouseUp || e?.modifierFlags.contains(.control) == true
+        // ⚠️ МОДИФИКАТОРЫ БЕРЁМ ЕЩЁ И ИЗ СОСТОЯНИЯ КЛАВИАТУРЫ, А НЕ ТОЛЬКО ИЗ СОБЫТИЯ КЛИКА
+        // (26.09.2026, macOS 27). На Маке автора после перехода на 27 клик по значку стал приходить с
+        // флагами 0, хотя Option был зажат: четыре ⌥-клика подряд в логе как «клик левый, флаги 0»,
+        // и скрытая запись звонка (задача 230) перестала запускаться. Последняя удачная запись была
+        // 23.09, ещё на 26. Состояние клавиатуры на уровне HID не зависит ни от того, как система
+        // доставила клик, ни от чужих перехватчиков клавиш, поэтому проверяем по нему тоже.
+        let hid = CGEventSource.flagsState(.hidSystemState)
+        let control = e?.modifierFlags.contains(.control) == true || hid.contains(.maskControl)
+        let right = e?.type == .rightMouseUp || control
+        let option = e?.modifierFlags.contains(.option) == true || hid.contains(.maskAlternate)
+        // Одна строка на клик по значку: клики редкие, а без этой строки «⌥-клик не работает» не
+        // отличить от «клик пришёл без ⌥».
+        kbLog("значок: клик \(right ? "правый" : "левый")\(option ? " с ⌥" : ""), событие \(e.map { String($0.type.rawValue) } ?? "нет"), флаги события \(e?.modifierFlags.rawValue ?? 0), клавиатура \(hid.rawValue)")
+        // ⌥-клик — скрытая запись звонка (задача 230): ни в меню, ни в настройках её нет.
+        if !right, option, ReleaseFeatures.callRecorder { onToggleCallRecording?(); return }
         if right { runQuickAction() } else { showMenu() }
     }
 
@@ -567,6 +650,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private func populate(_ menu: NSMenu) {
+        twinLetters.removeAll()   // скрытые дубли пунктов строятся заново под текущую раскладку
         // Заголовок меню = ВЕРСИЯ, а не слоган (просьба автора 21.07: «раскладка под контролем» —
         // приятно, но бесполезно; версию хочется видеть сразу). Плюс два по-настоящему полезных
         // индикатора: «-dev» (чтобы никогда больше не диагностировать не ту сборку — инцидент 21.07)
@@ -650,6 +734,21 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             let warn = NSMenuItem(title: problem, action: nil, keyEquivalent: "")
             warn.isEnabled = false
             warn.image = icon("exclamationmark.triangle.fill", color: .systemOrange)
+            // ⚠️ У СКРЫТОГО ВВОДА СТРОКА ЖИВАЯ, А НЕ ПРОСТО КРАСНАЯ (автор 26.08.2026, просьба
+            // повторилась семь раз: #159, #163, #167, #185, #189, #196, #197). Люди видят «клавиатуру
+            // скрыла другая программа» и не понимают ни что это, ни что нажать. Объяснение у нас
+            // было, но жило в подсказке значка в строке меню, а её никто не наводит.
+            //
+            // Пункт делаем ВКЛЮЧЁННЫМ намеренно, по двум причинам. Во-первых, у выключенных пунктов
+            // macOS показывает toolTip не всегда, и подсказка «по наведению» могла тихо не появиться
+            // ни у кого. Во-вторых, #197 просил ровно кликабельность: «чтобы я мог получить сразу
+            // дополнительную информацию». Так одно решение закрывает обе просьбы.
+            if AppHealth.iconState == .secureInput {
+                warn.toolTip = L10n.t("health.secureInputWho")
+                warn.isEnabled = true
+                warn.target = self
+                warn.action = #selector(showSecureInputHelp)
+            }
             menu.addItem(warn)
             menu.addItem(.separator())
         }
@@ -669,6 +768,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                           "arrow.triangle.2.circlepath",                // SF 1
                           "arrow.2.squarepath")
         menu.addItem(auto)
+        addLayoutTwins(of: auto, keyCode: 0)   // a
 
         // ПАУЗА — СРАЗУ ПОД АВТОПЕРЕКЛЮЧЕНИЕМ, вместо прежней строки-подсказки «Переключить слово:
         // ⌥⇧» (автор 07.08). Место выбрано по смыслу: это соседний тумблер того же самого, только на
@@ -724,6 +824,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         vh.image = icon("clock.arrow.trianglehead.counterclockwise.rotate.90",   // SF 6, macOS 15
                         "clock.arrow.circlepath")
         menu.addItem(vh)
+        addLayoutTwins(of: vh, keyCode: 4)     // h
 
         if VoiceHistory.shared.lastVisible() != nil {
             let copyLast = NSMenuItem(title: L10n.t("menu.copyLast"), action: #selector(copyLastDictation), keyEquivalent: "c")
@@ -732,6 +833,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             copyLast.image = icon("document.on.document",   // SF 6, macOS 15 — переименование doc.* → document.*
                                   "doc.on.doc")
             menu.addItem(copyLast)
+            addLayoutTwins(of: copyLast, keyCode: 8)   // c
         }
 
         menu.addItem(.separator())
@@ -760,12 +862,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         upd.target = self
         upd.image = icon("arrow.down.circle")
         menu.addItem(upd)
+        addLayoutTwins(of: upd, keyCode: 32)   // u
 
         let report = NSMenuItem(title: L10n.t("menu.report"), action: #selector(reportProblem), keyEquivalent: "r")
         report.keyEquivalentModifierMask = []
         report.target = self
         report.image = icon("exclamationmark.bubble")
         menu.addItem(report)
+        addLayoutTwins(of: report, keyCode: 15)   // r
 
         menu.addItem(.separator())   // «Выйти» снова один за разделителем, чтобы не нажать случайно
 
@@ -773,6 +877,46 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         quit.target = self
         quit.image = icon("power")
         menu.addItem(quit)
+    }
+
+    /// ⚠️ СКРЫТЫЕ ДУБЛИ ПУНКТОВ ДЛЯ НЕЛАТИНСКОЙ РАСКЛАДКИ (задача 255, отзыв #287, 24.09.2026).
+    /// Буква пункта без модификатора сравнивается с тем, что ПЕЧАТАЕТ клавиша, а подстановку
+    /// латиницы macOS делает только для сочетаний с ⌘. На русской физическая R даёт «к», и
+    /// «Сообщить о проблеме» молчал. Для программы, которая живёт ровно на стыке раскладок,
+    /// это было особенно неловко.
+    ///
+    /// Сразу за пунктом кладём его невидимую копию: то же действие, буква той же физической
+    /// клавиши в ТЕКУЩЕЙ раскладке. `allowsKeyEquivalentWhenHidden` (AppKit, macOS 10.13) оставляет
+    /// скрытому пункту его сочетание. Видимая колонка сочетаний не меняется, свой разбор событий не
+    /// появляется: сопоставляет по-прежнему AppKit. Действия этих пяти пунктов не читают `sender`.
+    ///
+    /// ⚠️ ТОЛЬКО ТЕКУЩАЯ РАСКЛАДКА, А НЕ ВСЕ УСТАНОВЛЕННЫЕ (ревью 24.09). Первая версия брала буквы
+    /// из всех нелатинских раскладок сразу, и у кого включены две похожие (русская и болгарская,
+    /// русская и фонетическая), одна и та же буква доставалась РАЗНЫМ пунктам: «к» открывала
+    /// обновления вместо отзыва, а буквы, которые раньше ничего не делали, молча выключали
+    /// автопереключение. Меню и так пересобирается на каждое открытие (`menuNeedsUpdate`), поэтому
+    /// текущей раскладки достаточно. Берём её из `KeyboardLayoutCache`, а не спрашиваем TIS: у
+    /// фоновой программы «текущий источник» бывает несвежим, а кэш обновляется на каждую смену.
+    /// Одна буква достаётся не больше чем одному пункту (`twinLetters`).
+    ///
+    /// Физическую клавишу берём из ЛАТИНСКОЙ раскладки человека (`DynamicKeymap.latinKeyCodes`):
+    /// у AZERTY «a» стоит на месте U.S.-«q». `ansiKeyCode` — запасной вариант, пока таблица не
+    /// построена. Латинская текущая раскладка дублей не получает: там буква пункта и так работает.
+    private var twinLetters = Set<Character>()
+    private func addLayoutTwins(of item: NSMenuItem, keyCode ansiKeyCode: UInt16) {
+        guard let latin = item.keyEquivalent.first, let target = item.menu else { return }
+        let kc = DynamicKeymap.latinKeyCodes[latin] ?? ansiKeyCode
+        var dead: UInt32 = 0
+        let typed = KeyboardLayoutCache.characters(keyCode: Int64(kc), flags: [], deadState: &dead)
+        guard typed.count == 1, let ch = typed.first, !ch.isASCII, ch.isLetter,
+              !twinLetters.contains(ch) else { return }
+        twinLetters.insert(ch)
+        let twin = NSMenuItem(title: item.title, action: item.action, keyEquivalent: String(ch))
+        twin.keyEquivalentModifierMask = []
+        twin.target = item.target
+        twin.isHidden = true
+        twin.allowsKeyEquivalentWhenHidden = true
+        target.addItem(twin)
     }
 
     /// Подменю «Микрофон» — список устройств ввода, галочка на выбранном.
@@ -805,6 +949,15 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
     }
+
+    /// Клик по строке про скрытый ввод открывает «Приватность» — там объяснение и живёт.
+    ///
+    /// ⚠️ ЗДЕСЬ БЫЛО МОДАЛЬНОЕ ОКНО, И ОНО ОТВЕРГНУТО (автор 26.08.2026): «мне просто не нравится
+    /// отдельно всплывающее окно, большое с длинным текстом, странно выглядит». Пять абзацев в
+    /// NSAlert это стена, которую закрывают не читая, и у неё нет своего места в интерфейсе.
+    /// В «Приватности» тот же текст стоит там, куда человек и так приходит с вопросом «что эта
+    /// программа видит и почему она молчит», и исчезает оттуда, когда мешать перестало.
+    @objc private func showSecureInputHelp() { onOpenPrivacy?() }
 
     @objc private func toggleAuto() {
         let newValue = !settings.autoEnabled
@@ -844,6 +997,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        NSPasteboard.general.kbNoteOurs()   // иначе история буфера запишет нашу же копию (задача 228)
         VoiceIndicator.shared.showToast(L10n.t("menu.copyLastDone"))
     }
     /// Пауза изменилась: меню пересобирается при открытии само, но значок и подсказка живут

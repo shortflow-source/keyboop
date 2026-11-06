@@ -1,16 +1,39 @@
 import AppKit
+import Darwin
+import UniformTypeIdentifiers
 
 /// Окно истории голосового набора (в духе Superwhisper/Wispr, в нашем стиле):
 /// поиск, чистый список карточек (действия проявляются по наведению — как в Things/Mail,
 /// чтобы иконки не наезжали на дату), крупная ОСНОВНАЯ кнопка записи (coral pill),
 /// мелкие вторичные иконки (поверх окон / настройки / очистить).
 final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, NSSearchFieldDelegate {
+    /// Окно истории, которое сейчас показано: клик по значку в Dock возвращает именно его.
+    static weak var frontmost: VoiceHistoryWindowController?
     private var all: [VoiceHistory.Entry] = []
     private var filtered: [VoiceHistory.Entry] = []
     private let search = NSSearchField()
     private let listStack = NSStackView()
     private let scroll = NSScrollView()
     private let emptyView = NSStackView()
+    private let emptyLabel = NSTextField(labelWithString: "")
+    // Импорт аудиофайла (задача 229): строка прогресса под поиском и раскрытие длинных записей.
+    private let progressBox = NSView()
+    private let progressLabel = NSTextField(labelWithString: "")
+    private let progressBar = NSProgressIndicator()
+    private let progressCancel = NSButton(title: "", target: nil, action: nil)
+    private var progressHeight: NSLayoutConstraint?
+    private var expanded = Set<Date>()
+    /// Сколько карточек ленты нарисовано. Лента рисуется порциями: с 24.09.2026 история держит до
+    /// 3000 диктовок (срок хранения 7 и 30 дней), а карточки здесь настоящие вьюхи со своим
+    /// текстом, плеером и кнопками. ЗАМЕР 24.09 (M1 Max, `KEYBOOP_HISTDUMP_PAD=400`): карточка
+    /// стоит около 4 мс, вся лента из 408 записей собиралась 2,3 с, порция из 150 — 0,6 с, из 50 —
+    /// 0,2 с. Пересборка идёт на каждое открытие, новую запись и запрос в поиске, поэтому 50.
+    /// Для сравнения: прежние потолки пускали до 170 карточек, то есть те же 0,6 с у тех, кто
+    /// копил буфер, так что порция это заодно и ускорение для них.
+    static let pageSize = 50
+    private var shownLimit = pageSize
+    /// Поиск пересобирает ленту не на каждую букву, а после короткой паузы в наборе.
+    private var searchDebounce: DispatchWorkItem?
     private let recordBtn = PillButton()
     private let pinBtn = NSButton()
     private let translBtn = SecondaryClickButton()
@@ -22,6 +45,10 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
     private let df: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "d MMM, HH:mm"
         f.locale = Locale(identifier: L10n.current == .ru ? "ru_RU" : "en_US"); return f
+    }()
+    private let exportDF: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmmss"
+        f.locale = Locale(identifier: "en_US_POSIX"); return f
     }()
 
     var onOpenVoiceSettings: (() -> Void)?
@@ -55,12 +82,19 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
     }
 
     private func reallyShow() {
+        shownLimit = Self.pageSize
         reload()
+        // Пока окно открыто, в Dock стоит значок с подписью (автор 04.09): иначе окно, ушедшее под
+        // чужое, не найти без повторного вызова через меню.
+        Self.frontmost = self
+        DockPresence.acquire(.history)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         // НЕ держим фокус в поле поиска: иначе диктовка сыплется в него. Курсор — нигде.
         window?.makeFirstResponder(nil)
         startRefresh()
+        // Окно закрыли и открыли посреди импорта: строка прогресса возвращается сама.
+        if AudioImporter.shared.isRunning, let p = AudioImporter.shared.lastProgress { showProgress(p) }
         // Мгновенное обновление при новой записи (надёжнее поллинга): подписка на уведомление.
         NotificationCenter.default.removeObserver(self, name: .keyboopVoiceHistoryChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(historyChanged),
@@ -69,8 +103,15 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
 
     @objc private func historyChanged() {
         DispatchQueue.main.async { [weak self] in
-            self?.reload()
-            self?.scrollToTop()   // новая запись сверху — показываем её сразу
+            guard let self else { return }
+            // Новая запись сверху: порцию сбрасываем и мотаем к ней. Удаление карточки и тихая
+            // чистка по сроку приходят ТЕМ ЖЕ уведомлением, и там человек читает ленту где-то в
+            // середине: сбросить её к первым 50 значило бы выбросить его из места (ревью 24.09).
+            let newest = VoiceHistory.shared.all().last?.date
+            let isNew = newest != nil && newest != self.all.first?.date
+            if isNew { self.shownLimit = Self.pageSize }
+            self.reload()
+            if isNew { self.scrollToTop() }
         }
     }
 
@@ -93,6 +134,8 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
 
     func windowWillClose(_ notification: Notification) {
         VoiceClipPlayerView.stopAll()   // окно ушло — голос из него звучать не должен
+        if Self.frontmost === self { Self.frontmost = nil }
+        DockPresence.release(.history)
         refreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self, name: .keyboopVoiceHistoryChanged, object: nil)
     }
@@ -103,12 +146,18 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         guard let content = window?.contentView else { return }
         let dump = ProcessInfo.processInfo.environment["KEYBOOP_DUMP"] == "1"
         let bg: NSView
+        let drop: AudioDropHost
         if dump {                                   // непрозрачный ТЁМНЫЙ фон → cacheDisplay-снимок (окно тёмное)
-            let s = NSView(); s.wantsLayer = true
-            s.layer?.backgroundColor = NSColor(white: 0.16, alpha: 1).cgColor; bg = s
+            let s = AudioDropPlainView(); s.wantsLayer = true
+            s.layer?.backgroundColor = NSColor(white: 0.16, alpha: 1).cgColor; bg = s; drop = s
         } else {
-            let eff = NSVisualEffectView(); eff.material = .underWindowBackground; eff.blendingMode = .behindWindow; bg = eff
+            let eff = AudioDropEffectView(); eff.material = .underWindowBackground; eff.blendingMode = .behindWindow
+            bg = eff; drop = eff
         }
+        // Аудиофайл можно перетащить в любое место окна (автор 04.09): контейнер под всеми
+        // элементами зарегистрирован на файлы, а AppKit ищет получателя вверх по иерархии от того,
+        // над чем отпустили, поэтому карточки и поиск не мешают.
+        if ReleaseFeatures.audioImport { drop.onDrop = { [weak self] url in self?.beginImport(url: url) } }
         bg.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(bg)
 
@@ -117,6 +166,39 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         search.controlSize = .large
         search.delegate = self
         bg.addSubview(search)
+
+        // Строка прогресса импорта (задача 229): видна только пока файл расшифровывается.
+        progressBox.translatesAutoresizingMaskIntoConstraints = false
+        progressBox.isHidden = true
+        progressLabel.font = .systemFont(ofSize: 11); progressLabel.textColor = .secondaryLabelColor
+        progressLabel.lineBreakMode = .byTruncatingMiddle
+        progressLabel.translatesAutoresizingMaskIntoConstraints = false
+        progressBar.style = .bar; progressBar.isIndeterminate = false
+        progressBar.minValue = 0; progressBar.maxValue = 1
+        progressBar.controlSize = .small
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        progressCancel.title = L10n.t("hist.importCancel")
+        progressCancel.bezelStyle = .rounded; progressCancel.controlSize = .small
+        progressCancel.target = self; progressCancel.action = #selector(cancelImport)
+        progressCancel.translatesAutoresizingMaskIntoConstraints = false
+        progressBox.addSubview(progressLabel); progressBox.addSubview(progressCancel); progressBox.addSubview(progressBar)
+        bg.addSubview(progressBox)
+        let ph = progressBox.heightAnchor.constraint(equalToConstant: 0)
+        ph.isActive = true; progressHeight = ph
+        NSLayoutConstraint.activate([
+            progressLabel.topAnchor.constraint(equalTo: progressBox.topAnchor, constant: 6),
+            progressLabel.leadingAnchor.constraint(equalTo: progressBox.leadingAnchor, constant: 4),
+            progressLabel.trailingAnchor.constraint(lessThanOrEqualTo: progressCancel.leadingAnchor, constant: -8),
+            progressCancel.centerYAnchor.constraint(equalTo: progressLabel.centerYAnchor),
+            progressCancel.trailingAnchor.constraint(equalTo: progressBox.trailingAnchor),
+            progressBar.topAnchor.constraint(equalTo: progressLabel.bottomAnchor, constant: 5),
+            progressBar.leadingAnchor.constraint(equalTo: progressBox.leadingAnchor, constant: 4),
+            progressBar.trailingAnchor.constraint(equalTo: progressBox.trailingAnchor),
+        ])
+        NotificationCenter.default.addObserver(self, selector: #selector(importProgressed(_:)),
+                                               name: .keyboopAudioImportProgress, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(importDidFinish(_:)),
+                                               name: .keyboopAudioImportFinished, object: nil)
 
         listStack.orientation = .vertical
         listStack.alignment = .width   // карточки одинаковой ширины на всю колонку (cross-axis sizing)
@@ -138,7 +220,7 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         emptyIcon.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
         emptyIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 26, weight: .regular)
         emptyIcon.contentTintColor = .quaternaryLabelColor
-        let emptyLabel = NSTextField(labelWithString: L10n.t("hist.empty"))
+        emptyLabel.stringValue = emptyText()
         emptyLabel.font = .systemFont(ofSize: 12); emptyLabel.textColor = .tertiaryLabelColor
         emptyLabel.alignment = .center
         emptyView.orientation = .vertical; emptyView.alignment = .centerX; emptyView.spacing = 10
@@ -195,6 +277,9 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
 
         let setBtn = secondaryIcon("gearshape", L10n.t("hist.settings"), #selector(openSettings))
         let clearBtn = secondaryIcon("trash", L10n.t("voice.histClear"), #selector(clearAll))
+        // Импорт аудиофайла (задача 229) стоит рядом с настройками и очисткой: автор 04.09 —
+        // «вот там же можно добавить кнопку».
+        let importBtn = secondaryIcon("waveform.badge.plus", L10n.t("hist.import"), #selector(importAudio))
 
         // ⚠️ НИЖНЯЯ ПОЛОСА ОДНА, А НЕ ДВЕ (автор 10.08). Раньше «Записать» занимала всю ширину, а
         // мелкие кнопки жались отдельной строкой над ней: две полосы съедали высоту у списка и
@@ -207,8 +292,11 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         // «Записать» стоит РОВНО ПО ЦЕНТРУ окна, а мелкие кнопки прижаты к правому краю. Через
         // NSStackView этого не добиться: он центрирует содержимое целиком, и главная кнопка уезжает
         // влево ровно на ширину соседей. Поэтому три отдельных якоря.
-        let secondaryBar = NSStackView(views: [setBtn, clearBtn])
-        secondaryBar.orientation = .horizontal; secondaryBar.spacing = 6; secondaryBar.alignment = .centerY
+        // PERSONAL: импорт аудио выключен (`ReleaseFeatures.audioImport`) — кнопки нет.
+        let secondaryBar = NSStackView(views: ReleaseFeatures.audioImport ? [importBtn, setBtn, clearBtn] : [setBtn, clearBtn])
+        // Между иконками воздух (автор 04.09: «чуть-чуть разнести»): три иконки впритык читались
+        // как одна кнопка.
+        secondaryBar.orientation = .horizontal; secondaryBar.spacing = 16; secondaryBar.alignment = .centerY
         secondaryBar.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(secondaryBar)
         bg.addSubview(recordBtn)
@@ -223,7 +311,10 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
             search.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 14),
             search.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -14),
 
-            scroll.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 10),
+            progressBox.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 4),
+            progressBox.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 14),
+            progressBox.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -14),
+            scroll.topAnchor.constraint(equalTo: progressBox.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 10),
             scroll.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
             scroll.bottomAnchor.constraint(equalTo: secondaryBar.topAnchor, constant: -10),
@@ -297,28 +388,58 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
 
     private func reload() {
         all = VoiceHistory.shared.all().reversed()
+        emptyLabel.stringValue = emptyText()
         applyFilter()
+    }
+    /// Подсказка пустого окна зависит от того, что в него вообще может попасть.
+    private func emptyText() -> String {
+        AppSettings.shared.clipboardHistoryEnabled ? L10n.t("hist.emptyClip") : L10n.t("hist.empty")
     }
     private func reloadIfChanged() {
         let c = VoiceHistory.shared.all().count
         if c != lastCount { reload() }
     }
     private func applyFilter() {
-        let q = search.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
-        filtered = q.isEmpty ? all : all.filter { $0.text.lowercased().contains(q) }
+        // Поиск идёт по обоим типам записей сразу (задача 228): человеку не нужно помнить,
+        // продиктовал он это или скопировал. Имя программы у записи буфера тоже ищется.
+        let q = search.stringValue
+        filtered = all.filter { HistoryPolicy.matches($0, query: q) }
         lastCount = all.count
         rebuildCards()
     }
     private func rebuildCards() {
         listStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        for e in filtered {
-            let c = card(e)
-            listStack.addArrangedSubview(c)
-            // ЯВНО фиксируем ширину карточки = ширине списка (alignment=.width не растягивал
-            // короткие записи → они выглядели как узкие «чат-пузыри» справа). Теперь все ровные.
-            c.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
-        }
+        // ЯВНО фиксируем ширину карточки = ширине списка (alignment=.width не растягивал
+        // короткие записи → они выглядели как узкие «чат-пузыри» справа). Теперь все ровные.
+        filtered.prefix(shownLimit).forEach(appendCard)
+        if filtered.count > shownLimit { listStack.addArrangedSubview(moreButton()) }
         emptyView.isHidden = !filtered.isEmpty
+    }
+    private func appendCard(_ e: VoiceHistory.Entry) {
+        let c = card(e)
+        listStack.addArrangedSubview(c)
+        c.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
+    }
+
+    /// «Показать ещё» в конце ленты. Поиск идёт по ВСЕЙ истории, порция ограничивает только
+    /// то, что нарисовано, поэтому найденная старая запись всегда доступна этой кнопкой.
+    private func moreButton() -> NSView {
+        let next = min(Self.pageSize, filtered.count - shownLimit)
+        let title = String(format: L10n.t("hist.more"), Self.grouped(next), Self.grouped(filtered.count))
+        let b = NSButton(title: title, target: self, action: #selector(showMore))
+        b.isBordered = false; b.bezelStyle = .inline
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: DS.coral, .font: NSFont.systemFont(ofSize: 12, weight: .medium)])
+        return b
+    }
+    /// Следующая порция ДОПИСЫВАЕТСЯ к нарисованным, а не пересобирает всю ленту: иначе каждое
+    /// нажатие стоило бы дороже предыдущего.
+    @objc private func showMore() {
+        if let last = listStack.arrangedSubviews.last, !(last is HoverCard) { last.removeFromSuperview() }
+        let from = shownLimit
+        shownLimit += Self.pageSize
+        filtered[min(from, filtered.count)..<min(shownLimit, filtered.count)].forEach(appendCard)
+        if filtered.count > shownLimit { listStack.addArrangedSubview(moreButton()) }
     }
 
     private func card(_ e: VoiceHistory.Entry) -> NSView {
@@ -327,6 +448,7 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         date.font = .systemFont(ofSize: 11, weight: .medium); date.textColor = .secondaryLabelColor
         date.setContentCompressionResistancePriority(.required, for: .horizontal)
         date.setContentHuggingPriority(.required, for: .horizontal)
+        let kind = kindBadge(e)
 
         let copy = cardIcon("doc.on.doc", L10n.t("hist.copy"), #selector(copyEntry(_:)), tag)
         let del = cardIcon("trash", L10n.t("hist.del"), #selector(deleteEntry(_:)), tag)
@@ -334,24 +456,82 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         let text = WrappingLabel(string: e.text)
         text.font = .systemFont(ofSize: 13); text.textColor = .labelColor
         text.isSelectable = true                       // выделить и скопировать ЧАСТЬ текста
-        text.maximumNumberOfLines = 0                  // перенос по словам, весь текст видно (не усекаем)
         text.lineBreakMode = .byWordWrapping
-
+        // Длинные записи (расшифровка часового созвона, задача 229) показываем свёрнутыми до десяти
+        // строк с кнопкой «Показать целиком»: иначе одна запись превращает ленту в простыню.
+        let long = e.text.count > Self.collapseThreshold
+        let isExpanded = expanded.contains(e.date)
+        if long && !isExpanded {
+            text.maximumNumberOfLines = Self.collapsedLines
+            text.cell?.truncatesLastVisibleLine = true
+        } else {
+            text.maximumNumberOfLines = 0              // весь текст видно (не усекаем)
+        }
+        var bodyViews: [NSView] = [text]
+        if long { bodyViews.append(expandButton(tag: tag, expanded: isExpanded, count: e.text.count)) }
+        // Порядок действий по решению автора 04.09: скопировать → (сохранить текст) → сохранить
+        // аудио → удалить. Копирование первое как самое частое, удаление последнее как необратимое.
+        var actions: [NSButton] = [copy]
+        if e.isImported {
+            actions.append(cardIcon("doc.plaintext", L10n.t("hist.saveText"), #selector(saveText(_:)), tag))
+        }
         // Аудио есть только если человек включил сохранение И файл ещё жив. Проверяем именно файл, а
         // не только поле записи: клип мог не пережить перевыпуск ключа, и плеер на пустоту предлагал
         // бы нажать кнопку, которая ничего не делает.
-        guard let clip = e.audio, VoiceClips.exists(clip) else {
-            return HoverCard(date: date, body: text, actions: [copy, del])
+        if let clip = e.audio, VoiceClips.exists(clip) {
+            actions.append(cardIcon("square.and.arrow.down", L10n.t("hist.saveAudio"), #selector(saveAudio(_:)), tag))
+            bodyViews.append(VoiceClipPlayerView(clipID: clip, wave: e.wave))
         }
-        let body = NSStackView(views: [text, VoiceClipPlayerView(clipID: clip, wave: e.wave)])
+        actions.append(del)
+        guard bodyViews.count > 1 else { return HoverCard(date: date, kind: kind, body: text, actions: actions) }
+        let body = NSStackView(views: bodyViews)
         body.orientation = .vertical
         body.alignment = .leading
         body.spacing = 8
         body.translatesAutoresizingMaskIntoConstraints = false
-        // Плеер тянем во всю ширину карточки: иначе NSStackView сжимает его по содержимому и дорожка
-        // превращается в огрызок рядом с длинным текстом.
-        body.arrangedSubviews.last?.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
-        return HoverCard(date: date, body: body, actions: [copy, del])
+        // Текст и плеер тянем во всю ширину карточки: иначе NSStackView сжимает плеер по содержимому
+        // и дорожка превращается в огрызок рядом с длинным текстом.
+        text.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        if let player = bodyViews.last as? VoiceClipPlayerView {
+            player.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        }
+        return HoverCard(date: date, kind: kind, body: body, actions: actions)
+    }
+
+    /// Порог свёрнутого показа: короткие диктовки видны целиком, часовой созвон складывается.
+    static let collapseThreshold = 700
+    static let collapsedLines = 10
+
+    private func expandButton(tag: Int, expanded: Bool, count: Int) -> NSButton {
+        let title = expanded ? L10n.t("hist.collapse")
+                             : String(format: L10n.t("hist.expand"), Self.grouped(count))
+        let b = NSButton(title: title, target: self, action: #selector(toggleExpand(_:)))
+        b.isBordered = false; b.bezelStyle = .inline; b.tag = tag
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: DS.coral, .font: NSFont.systemFont(ofSize: 11, weight: .medium)])
+        b.setContentHuggingPriority(.required, for: .horizontal)
+        return b
+    }
+    @objc private func toggleExpand(_ s: NSButton) {
+        guard s.tag >= 0, s.tag < all.count else { return }
+        let e = all[s.tag]
+        if expanded.contains(e.date) { expanded.remove(e.date) } else { expanded.insert(e.date) }
+        // Перерисовываем ОДНУ карточку на её месте, а не всю ленту: после нескольких «Показать
+        // ещё» на экране сотни карточек по ~4 мс, и раскрытие стоило бы секунды (ревью 24.09).
+        // Позиция в стеке совпадает с позицией в `filtered`: кнопка «ещё» всегда последняя.
+        guard let i = filtered.firstIndex(where: { $0.date == e.date && $0.text == e.text }),
+              i < listStack.arrangedSubviews.count, listStack.arrangedSubviews[i] is HoverCard
+        else { rebuildCards(); return }
+        let old = listStack.arrangedSubviews[i]
+        listStack.removeArrangedSubview(old)
+        old.removeFromSuperview()
+        let c = card(e)
+        listStack.insertArrangedSubview(c, at: i)
+        c.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
+    }
+    private static func grouped(_ n: Int) -> String {
+        let f = NumberFormatter(); f.numberStyle = .decimal; f.groupingSeparator = " "
+        return f.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
     /// Иконка-действие на карточке (проявляется по наведению).
@@ -369,18 +549,63 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         return b
     }
 
+    /// Подпись типа записи: значок и слово, а не цвет (цвет никогда не носитель смысла). У записи
+    /// буфера ещё и программа, из которой скопировали: по ней же работает поиск.
+    private func kindBadge(_ e: VoiceHistory.Entry) -> NSView {
+        let title: String
+        let symbol: String
+        switch e.resolvedKind {
+        case .clipboard:
+            title = e.app.map { String(format: L10n.t("hist.kind.clipboardFrom"), $0) } ?? L10n.t("hist.kind.clipboard")
+            symbol = "doc.on.clipboard"
+        case .imported:
+            title = String(format: L10n.t("hist.kind.file"), e.app ?? "")
+            symbol = "waveform"
+        case .call:
+            title = String(format: L10n.t("hist.kind.call"), e.app ?? "")
+            symbol = "phone"
+        case .dictation:
+            title = L10n.t("hist.kind.dictation")
+            symbol = "mic"
+        }
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 9, weight: .medium)
+        // Тот же цвет, что у даты: первый рендер с `tertiaryLabelColor` дал подпись, которую на
+        // тёмной карточке не прочитать (снимок 04.09). Иерархия держится весом, а не бледностью.
+        icon.contentTintColor = .secondaryLabelColor
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 11, weight: .regular); label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [icon, label])
+        row.orientation = .horizontal; row.spacing = 3; row.alignment = .centerY
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
     private func entryTag(_ e: VoiceHistory.Entry) -> Int {
         all.firstIndex { $0.date == e.date && $0.text == e.text } ?? -1
     }
 
     // MARK: actions
 
-    func controlTextDidChange(_ obj: Notification) { applyFilter() }
+    func controlTextDidChange(_ obj: Notification) {
+        searchDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.shownLimit = Self.pageSize   // новый запрос начинается с первой порции
+            self.applyFilter()
+        }
+        searchDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
 
     @objc private func copyEntry(_ s: NSButton) {
         guard s.tag >= 0, s.tag < all.count else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(all[s.tag].text, forType: .string)
+        NSPasteboard.general.kbNoteOurs()   // иначе история буфера запишет нашу же копию
         // короткий визуальный отклик: галочка на 1 c
         let prev = s.image
         s.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
@@ -389,12 +614,238 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
             s?.image = prev; s?.contentTintColor = .secondaryLabelColor
         }
     }
+    @objc private func saveAudio(_ s: NSButton) {
+        guard s.tag >= 0, s.tag < all.count,
+              let clip = all[s.tag].audio
+        else { return }
+        // Клип мог исчезнуть между отрисовкой карточки и кликом (например, из-за retention).
+        // Если кнопка уже была на экране, не делаем вид, что клика не было.
+        guard VoiceClips.exists(clip) else {
+            VoiceIndicator.shared.showToast(L10n.t("hist.saveAudioFailed"))
+            return
+        }
+
+        // Расшифровываем ТОЛЬКО после того, как человек выбрал место. До этого момента открытых
+        // байтов нет даже в памяти; после записи никакого временного файла за нами не остаётся.
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Audio]
+        panel.canCreateDirectories = true
+        panel.isMovable = true
+        panel.isExtensionHidden = false
+        panel.nameFieldStringValue = "Keyboop-\(exportDF.string(from: all[s.tag].date)).m4a"
+
+        // Это отдельная системная панель, а не sheet окна истории. Sheet нельзя двигать, и у
+        // истории, припаркованной у края экрана, широкая панель неизбежно вылезала за границу.
+        // `begin` остаётся асинхронным, но позицию и перемещение целиком отдаёт macOS.
+        s.isEnabled = false
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak s] response in
+            guard response == .OK, let destination = panel.url else {
+                s?.isEnabled = true
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak s] in
+                guard let data = VoiceClips.data(for: clip) else {
+                    DispatchQueue.main.async {
+                        s?.isEnabled = true
+                        VoiceIndicator.shared.showToast(L10n.t("hist.saveAudioFailed"))
+                    }
+                    return
+                }
+                do {
+                    // Временный inode сразу рождается 0600 в ВЫБРАННОЙ папке и затем атомарно
+                    // переименовывается. Поэтому даже на миг между write и chmod открытого 0644
+                    // файла не бывает; дополнительной plaintext-копии в системном temp тоже нет.
+                    try Self.writeExportSecurely(data, to: destination)
+                    let sizeKB = data.count / 1024
+                    DispatchQueue.main.async { [weak s] in
+                        s?.isEnabled = true
+                        kbLog("аудио диктовки: экспортировано \(sizeKB) КБ")
+                        let folderURL = destination.deletingLastPathComponent()
+                        let folderName = FileManager.default.displayName(atPath: folderURL.path)
+                        let message = String(format: L10n.t("hist.saveAudioDoneFolder"), folderName)
+                        VoiceIndicator.shared.showToast(message, onClick: {
+                            // Путь нигде не логируем. Finder получает URL только по явному клику
+                            // и выделяет именно экспортированный файл, а не просто открывает папку.
+                            NSWorkspace.shared.activateFileViewerSelecting([destination])
+                        })
+                        let previous = s?.image
+                        s?.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
+                        s?.contentTintColor = DS.coral
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak s] in
+                            s?.image = previous; s?.contentTintColor = .secondaryLabelColor
+                        }
+                    }
+                } catch {
+                    let nsError = error as NSError
+                    let failure = "\(nsError.domain):\(nsError.code)"
+                    DispatchQueue.main.async { [weak s] in
+                        s?.isEnabled = true
+                        // NSError.userInfo намеренно не пишем: там может быть имя/путь, выбранный человеком.
+                        kbLog("аудио диктовки: экспорт не удался (\(failure))")
+                        VoiceIndicator.shared.showToast(L10n.t("hist.saveAudioFailed"))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Атомарная запись без окна с широкими правами: `mkstemp` создаёт соседний файл сразу 0600,
+    /// а POSIX rename переносит этот же inode на выбранное имя. Любая ошибка оставляет destination
+    /// нетронутым и удаляет только наш скрытый временный файл.
+    private static func writeExportSecurely(_ data: Data, to destination: URL) throws {
+        let folder = destination.deletingLastPathComponent()
+        var template = Array(folder.appendingPathComponent(".keyboop-export.XXXXXX").path.utf8CString)
+        let fd = mkstemp(&template)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        let temporaryPath = String(cString: template)
+        var descriptorOpen = true
+        var moved = false
+        defer {
+            if descriptorOpen { Darwin.close(fd) }
+            if !moved { temporaryPath.withCString { _ = Darwin.unlink($0) } }
+        }
+
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                let count = Darwin.write(fd, base.advanced(by: offset), raw.count - offset)
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+                guard count > 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO)) }
+                offset += count
+            }
+        }
+        guard Darwin.fsync(fd) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard Darwin.close(fd) == 0 else {
+            descriptorOpen = false
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        descriptorOpen = false
+
+        let renamed = temporaryPath.withCString { source in
+            destination.path.withCString { target in Darwin.rename(source, target) }
+        }
+        guard renamed == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        moved = true
+    }
     @objc private func deleteEntry(_ s: NSButton) {
         guard s.tag >= 0, s.tag < all.count else { return }
         let e = all[s.tag]
+        // Ленту пересобирает `historyChanged` по уведомлению от `remove`. Свой `reload()` здесь
+        // собирал бы все нарисованные карточки второй раз подряд, а их теперь может быть сотни.
         VoiceHistory.shared.remove(date: e.date, text: e.text)
-        reload()
     }
+    // MARK: импорт аудиофайла (задача 229)
+
+    /// Общие проверки перед импортом: есть куда класть, никто уже не импортирует, есть модель.
+    private func canImport() -> Bool {
+        guard ReleaseFeatures.audioImport else { return false }
+        guard AppSettings.shared.voiceHistoryEnabled else {
+            VoiceIndicator.shared.showToast(L10n.t("hist.importNoHistory")); return false
+        }
+        guard !AudioImporter.shared.isRunning else {
+            VoiceIndicator.shared.showToast(L10n.t("hist.importBusy")); return false
+        }
+        guard VoiceController.shared.hasUsableModel else { VoiceController.shared.onNeedModel?(); return false }
+        return true
+    }
+    /// Один вход для кнопки и для перетаскивания.
+    private func beginImport(url: URL) {
+        guard canImport() else { return }
+        if AudioImporter.shared.start(url: url) {
+            progressCancel.isEnabled = true
+            showProgress(AudioImporter.Progress(fileName: url.lastPathComponent, processed: 0, total: 0, remaining: nil))
+        }
+    }
+    @objc private func importAudio() {
+        guard canImport() else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio, .movie]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = L10n.t("hist.importTitle")
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.beginImport(url: url)
+        }
+    }
+    @objc private func cancelImport() {
+        AudioImporter.shared.cancel()
+        progressCancel.isEnabled = false
+    }
+    @objc private func importProgressed(_ n: Notification) {
+        guard let p = n.object as? AudioImporter.Progress else { return }
+        showProgress(p)
+    }
+    @objc private func importDidFinish(_ n: Notification) {
+        showProgress(nil)
+        progressCancel.isEnabled = true
+        guard let o = n.object as? AudioImporter.Outcome else { return }
+        let key: String
+        var changed = false
+        switch o {
+        case .done:         key = "hist.importDone"; changed = true
+        case .partial:      key = "hist.importPartial"; changed = true
+        case .cancelled:    key = "hist.importCancelled"
+        case .empty:        key = "hist.importEmpty"
+        case .unreadable:   key = "hist.importFailed"
+        case .engineFailed: key = "hist.importEngineFailed"
+        }
+        VoiceIndicator.shared.showToast(L10n.t(key))
+        if changed { reload(); scrollToTop() }
+    }
+    private func showProgress(_ p: AudioImporter.Progress?) {
+        guard let p else {
+            progressBox.isHidden = true; progressHeight?.constant = 0
+            window?.contentView?.layoutSubtreeIfNeeded(); return
+        }
+        progressBox.isHidden = false; progressHeight?.constant = 46
+        var line = String(format: L10n.t("hist.importProgress"), p.fileName,
+                          ImportProgressFormat.clock(p.processed), ImportProgressFormat.clock(p.total))
+        if let r = p.remaining { line += " · " + String(format: L10n.t("hist.importEta"), ImportProgressFormat.clock(r)) }
+        progressLabel.stringValue = line
+        progressBar.doubleValue = p.total > 0 ? min(1, p.processed / p.total) : 0
+        window?.contentView?.layoutSubtreeIfNeeded()
+    }
+    /// Экспорт текста записи в .txt: расшифровка созвона обычно нужна как документ (задача 229).
+    @objc private func saveText(_ s: NSButton) {
+        guard s.tag >= 0, s.tag < all.count else { return }
+        let e = all[s.tag]
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        panel.isMovable = true
+        panel.isExtensionHidden = false
+        let base = (e.app.map { ($0 as NSString).deletingPathExtension } ?? "Keyboop").replacingOccurrences(of: "/", with: "-")
+        panel.nameFieldStringValue = "\(base)-\(exportDF.string(from: e.date)).txt"
+        s.isEnabled = false
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak s] response in
+            guard response == .OK, let destination = panel.url else { s?.isEnabled = true; return }
+            do {
+                try Self.writeExportSecurely(Data(e.text.utf8), to: destination)
+                s?.isEnabled = true
+                kbLog("история: текст экспортирован, \(e.text.count) симв.")
+                let folderName = FileManager.default.displayName(atPath: destination.deletingLastPathComponent().path)
+                VoiceIndicator.shared.showToast(String(format: L10n.t("hist.saveTextDoneFolder"), folderName), onClick: {
+                    NSWorkspace.shared.activateFileViewerSelecting([destination])
+                })
+            } catch {
+                s?.isEnabled = true
+                let nsError = error as NSError
+                kbLog("история: экспорт текста не удался (\(nsError.domain):\(nsError.code))")
+                VoiceIndicator.shared.showToast(L10n.t("hist.saveTextFailed"))
+            }
+        }
+    }
+
     @objc private func toggleRecord() {
         VoiceController.shared.toggleRecording()
         updateRecordButton()
@@ -513,17 +964,131 @@ final class VoiceHistoryWindowController: NSWindowController, NSWindowDelegate, 
         all = [
             .init(date: now.addingTimeInterval(-50),   text: "Можно проверить, как работает голосовой ввод прямо в этом окне.", audio: demoClip?.id, wave: demoClip?.wave),
             .init(date: now.addingTimeInterval(-240),  text: "Так, ну, смотрим."),
+            .init(date: now.addingTimeInterval(-400),  text: "https://keyboop.com/changelog/", kind: .clipboard, app: "Safari"),
             .init(date: now.addingTimeInterval(-900),  text: "Вот прямо сейчас пользуюсь этим голосовым вводом — и знаки препинания расставляются сами, без интернета."),
+            .init(date: now.addingTimeInterval(-1500), text: "Встречаемся в четверг в 15:00, ссылку на созвон пришлю утром.", kind: .clipboard, app: "Telegram"),
+            .init(date: now.addingTimeInterval(-2000), text: Self.sampleTranscript, kind: .imported, app: "созвон-по-релизу.m4a"),
             .init(date: now.addingTimeInterval(-3600), text: "It's time to test and ship it to the market."),
             .init(date: now.addingTimeInterval(-7200), text: "Короткая заметка на память.")
         ]
+        // Длинная лента (срок хранения 7 и 30 дней, 24.09.2026): KEYBOOP_HISTDUMP_PAD=N дописывает
+        // N выдуманных диктовок, меряет сборку всей ленты против одной порции и снимает НИЗ ленты,
+        // где стоит кнопка «Показать ещё». Настоящую историю не трогает, как и всё выше.
+        let pad = Int(ProcessInfo.processInfo.environment["KEYBOOP_HISTDUMP_PAD"] ?? "") ?? 0
+        for i in 0..<pad {
+            all.append(.init(date: now.addingTimeInterval(-7200 - Double(i + 1) * 900),
+                             text: "Выдуманная диктовка номер \(i + 1) для проверки длинной ленты."))
+        }
         filtered = all; lastCount = all.count
         defer { demoClip.map { VoiceClips.delete($0.id) } }   // демо-файл не переживает снимок
+        if pad > 0 {
+            func timed(_ limit: Int) -> Int {
+                shownLimit = limit
+                let t0 = ProcessInfo.processInfo.systemUptime
+                rebuildCards(); window?.contentView?.layoutSubtreeIfNeeded()
+                return Int((ProcessInfo.processInfo.systemUptime - t0) * 1000)
+            }
+            let full = timed(Int.max)
+            let series = [150, 150, 50, 50, 25, 25, Self.pageSize, Self.pageSize].map { "\($0):\(timed($0))" }
+            let more = listStack.arrangedSubviews.last.map { !($0 is HoverCard) } ?? false
+            kbLog("histdump: лента \(filtered.count) записей · вся за \(full) мс · порции (карточек:мс) \(series.joined(separator: " ")) · кнопка «ещё»=\(more)")
+        }
+        // Строка прогресса импорта на снимке: иначе её единственный способ увидеть — ждать файл.
+        showProgress(AudioImporter.Progress(fileName: "созвон-по-релизу.m4a", processed: 1503, total: 4920, remaining: 380))
+        // ⚗️ Три кандидата разом, чтобы сравнивать глазами рядом, а не по памяти (14.09.2026).
+        for b in DockPresence.Badge.allCases {
+            DockPresence.writeHistoryIconPNG(to: "/tmp/kb_dock_\(b.rawValue).png", badge: b)
+        }
         rebuildCards()
         window?.contentView?.layoutSubtreeIfNeeded()
         listStack.arrangedSubviews.compactMap { $0 as? HoverCard }.forEach { $0.revealForDump() }
         window?.contentView?.layoutSubtreeIfNeeded()
+        if pad > 0, let doc = scroll.documentView {       // к концу ленты: там кнопка «ещё»
+            doc.scroll(NSPoint(x: 0, y: max(0, doc.bounds.height - scroll.contentView.bounds.height)))
+        }
         dump(to: path)
+    }
+}
+
+extension VoiceHistoryWindowController {
+    /// Демо-расшифровка для снимка: длиннее порога сворачивания, с абзацами по паузам.
+    static let sampleTranscript = """
+        Давайте по порядку. Первое, что мы обсуждали на прошлой неделе, это выпуск беты и то, как \
+        люди на неё реагируют. Отзывов пришло больше, чем обычно, и большинство про диктовку.
+
+        По истории буфера обмена вопросов нет, всё работает, но тумблер надо перенести из голосового \
+        набора, потому что буфер к голосу не имеет никакого отношения. Пусть живёт в общих настройках, \
+        по крайней мере пока.
+
+        Дальше импорт аудиофайла. Я записывал рабочий звонок на час двадцать, и надо сразу \
+        предусмотреть, что туда будут грузить большие длинные файлы. Текст такого размера в истории \
+        должен быть свёрнут, а экспорт в документ тоже придётся предусмотреть, потому что искать в \
+        карточке час разговора никто не будет.
+
+        И последнее: про Windows пока ничего не обещаем, спрос фиксируем, но версию не начинаем. \
+        На этом всё, спасибо, до связи.
+        """
+}
+
+// MARK: - Приём аудиофайла перетаскиванием (задача 229)
+
+/// Контейнер окна истории принимает перетащенный аудио- или видеофайл в любом месте окна.
+protocol AudioDropHost: AnyObject {
+    var onDrop: ((URL) -> Void)? { get set }
+}
+
+enum AudioDrop {
+    /// Единственный подходящий файл из перетаскивания, иначе nil: пачку файлов не берём, потому что
+    /// импорт идёт по одному и очереди у него нет.
+    static func url(from info: NSDraggingInfo) -> URL? {
+        guard ReleaseFeatures.audioImport else { return nil }   // PERSONAL: импорт аудио выключен
+        let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                       options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        guard urls.count == 1, let u = urls.first,
+              let type = UTType(filenameExtension: u.pathExtension) else { return nil }
+        return (type.conforms(to: .audio) || type.conforms(to: .movie) || type.conforms(to: .audiovisualContent)) ? u : nil
+    }
+    /// Рамка на время перетаскивания: словом «можно бросать» здесь не скажешь, но рамка в цвете
+    /// действия плюс курсор копирования читаются одинаково всеми.
+    static func highlight(_ v: NSView, _ on: Bool) {
+        v.wantsLayer = true
+        v.layer?.borderColor = on ? DS.coral.cgColor : nil
+        v.layer?.borderWidth = on ? 2 : 0
+        v.layer?.cornerRadius = on ? 10 : 0
+    }
+}
+
+final class AudioDropEffectView: NSVisualEffectView, AudioDropHost {
+    var onDrop: ((URL) -> Void)?
+    override init(frame: NSRect) { super.init(frame: frame); registerForDraggedTypes([.fileURL]) }
+    required init?(coder: NSCoder) { super.init(coder: coder); registerForDraggedTypes([.fileURL]) }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard AudioDrop.url(from: sender) != nil else { return [] }
+        AudioDrop.highlight(self, true); return .copy
+    }
+    override func draggingExited(_ sender: NSDraggingInfo?) { AudioDrop.highlight(self, false) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { AudioDrop.highlight(self, false) }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        AudioDrop.highlight(self, false)
+        guard let u = AudioDrop.url(from: sender) else { return false }
+        onDrop?(u); return true
+    }
+}
+
+final class AudioDropPlainView: NSView, AudioDropHost {
+    var onDrop: ((URL) -> Void)?
+    override init(frame: NSRect) { super.init(frame: frame); registerForDraggedTypes([.fileURL]) }
+    required init?(coder: NSCoder) { super.init(coder: coder); registerForDraggedTypes([.fileURL]) }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard AudioDrop.url(from: sender) != nil else { return [] }
+        AudioDrop.highlight(self, true); return .copy
+    }
+    override func draggingExited(_ sender: NSDraggingInfo?) { AudioDrop.highlight(self, false) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { AudioDrop.highlight(self, false) }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        AudioDrop.highlight(self, false)
+        guard let u = AudioDrop.url(from: sender) else { return false }
+        onDrop?(u); return true
     }
 }
 
@@ -608,12 +1173,12 @@ final class PillButton: NSButton {
 
 // MARK: - HoverCard: карточка записи; действия проявляются по наведению (как в Things/Mail)
 
-/// Карточка истории: дата слева, действия (копировать/удалить) справа — скрыты, пока курсор
-/// не наведён (поэтому НИКОГДА не наезжают на дату). Тело — выделяемый переносимый текст.
+/// Карточка истории: дата слева, действия (сохранить аудио / копировать / удалить) справа — скрыты,
+/// пока курсор не наведён (поэтому НИКОГДА не наезжают на дату). Тело — выделяемый переносимый текст.
 final class HoverCard: NSView {
     private let actions: NSStackView
 
-    init(date: NSTextField, body: NSView, actions buttons: [NSButton]) {
+    init(date: NSTextField, kind: NSView? = nil, body: NSView, actions buttons: [NSButton]) {
         self.actions = NSStackView(views: buttons)
         super.init(frame: .zero)
         wantsLayer = true
@@ -630,8 +1195,8 @@ final class HoverCard: NSView {
         date.translatesAutoresizingMaskIntoConstraints = false
         let spacer = NSView(); spacer.translatesAutoresizingMaskIntoConstraints = false
         spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-        let header = NSStackView(views: [date, spacer, self.actions])
-        header.orientation = .horizontal; header.spacing = 4; header.alignment = .centerY
+        let header = NSStackView(views: [date] + (kind.map { [$0] } ?? []) + [spacer, self.actions])
+        header.orientation = .horizontal; header.spacing = 6; header.alignment = .centerY
         header.translatesAutoresizingMaskIntoConstraints = false
 
         body.translatesAutoresizingMaskIntoConstraints = false

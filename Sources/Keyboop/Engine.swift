@@ -36,6 +36,14 @@ final class Engine: EventTapHandler {
     /// но можно НЕ распространять: буфер чистим, следующая конверсия начинает с чистого листа.
     private var inFlightRealKeys = 0
 
+    /// macOS воспринимает два быстрых пробела как точку. Читаем официальный глобальный флаг AppKit
+    /// вне горячего tap-callback и обновляем по его нотификации; внутри клавиш — только дешёвый Bool.
+    private static let doubleSpacePeriodMaximumGap: TimeInterval = 0.45
+    private var systemDoubleSpacePeriodEnabled = false
+    private static func readSystemDoubleSpacePeriodEnabled() -> Bool {
+        NSSpellChecker.isAutomaticPeriodSubstitutionEnabled
+    }
+
     /// Единая точка завершения полёта синтетики (все completion'ы конверсий).
     private func endSyntheticFlight() {
         if inFlightRealKeys > 0 {
@@ -78,7 +86,12 @@ final class Engine: EventTapHandler {
     /// Таймер-поллер Secure Input (см. start(): на keyDown переход не поймать — событий нет).
     private var secureInputTimer: Timer?
     /// Когда Secure Input включился (для «держит уже N секунд» в логе снятия).
-    private var secureInputSince: TimeInterval = 0
+    ///
+    /// ⚠️ ЧАСЫ, А НЕ systemUptime (26.09.2026). `systemUptime` во сне не идёт, и в отзыве #298 эпизод,
+    /// который по часам лога длился десять минут, был подписан «держали ~12с»: скорее всего, Mac
+    /// спал с поднятым флагом. Разбор по такому логу врал ровно в том, сколько флаг мешал человеку.
+    /// Меняется только текст в логе, решения от этого числа не зависят.
+    private var secureInputSince = Date()
 
     /// Логируем ПЕРЕХОДЫ Secure Input (не каждое нажатие). На включении — ищем держателя:
     /// pid лежит в ioreg (kCGSSessionSecureInputPID); сам поиск — subprocess, поэтому строго
@@ -94,11 +107,11 @@ final class Engine: EventTapHandler {
         DispatchQueue.main.async { MenuBarController.shared?.refresh() }
         if !on {
             AppHealth.secureInputHolder = nil
-            let held = Int(ProcessInfo.processInfo.systemUptime - secureInputSince)
+            let held = max(0, Int(Date().timeIntervalSince(secureInputSince)))   // часы могли перевести назад
             kbLog("secure input СНЯТ (держали ~\(held)с) — Keyboop снова видит клавиатуру")
             return
         }
-        secureInputSince = ProcessInfo.processInfo.systemUptime
+        secureInputSince = Date()
         kbLog("secure input ВКЛЮЧЁН — macOS прячет клавиатуру от Keyboop (конверсия молчит СИСТЕМНО, это не поле настроек); ищу держателя…")
         DispatchQueue.global(qos: .utility).async {
             let p = Process()
@@ -193,10 +206,33 @@ final class Engine: EventTapHandler {
     /// «adguard»→«фdguard», «hello»→«рhello»). Теперь чистим ЛЕНИВО — синхронно перед следующим
     /// нажатием (clear, затем append), без гонки. (16.06.2026.)
     private var pendingContextClear = false
+    /// Время КЛИКА, а не его доставки нам (см. handleContextReset).
+    private var contextResetAt: TimeInterval = 0
     /// Первое слово после прыжка каретки (клик/навигация). Влияет ТОЛЬКО на одиночные буквы:
     /// там «нет соседей» означает либо начало ввода, либо середину уже написанного слова, и
     /// поступать надо противоположно. Снимается при первом же решении, см. convert-путь ниже.
     private var caretJumpedSinceClear = false
+
+    /// Что стояло слева от каретки в момент последнего её прыжка (задача 187).
+    ///
+    /// Спрашивается У СИСТЕМЫ в фоне, сразу на клике, и к моменту решения ответ уже готов. Зачем не
+    /// в момент решения — см. `SelectionText.caretLeftAsync`: решение принимается в главном потоке,
+    /// где живёт runloop перехватчика, и обращаться оттуда к Accessibility нельзя.
+    private var caretLeftAtJump: CaretLeft = .unknown
+    /// Поколение пробы: ответ на ПРОШЛЫЙ клик, пришедший после нового, должен быть выброшен.
+    private var caretProbeGen = 0
+    /// Программы, про которые ответ пробы уже записан (по одной строке на программу).
+    private var caretProbeSeenApps = Set<String>()
+
+    /// Была ли ПОСЛЕ прыжка каретки правка стирания (обычный Backspace).
+    ///
+    /// Это второй слой той же задачи 187, и работает он ТАМ, ГДЕ ACCESSIBILITY СЛЕП. Замер 22.08:
+    /// в Electron-приложениях (ChatGPT, редакторы, чаты) проба каретки не отвечает вовсе, а именно
+    /// там человек и печатает больше всего. Backspace же виден нам всегда, из своего же потока.
+    /// Смысл сигнала прямой: чтобы заменить букву ВНУТРИ написанного слова, неверную сначала стирают.
+    /// Опасный случай 02.08 («поставил правильную г, а мы вернули u») без Backspace невозможен, а
+    /// «кликнул в пустое поле и начал фразу с одиночной А» — наоборот, без него и происходит.
+    private var backspaceSinceJump = false
 
     /// Мягкий отложенный сброс контекста (активация чужого приложения — каретка не двигалась):
     /// перед следующим нажатием забываем завершённое слово/группу, НО сохраняем currentWord.
@@ -210,6 +246,7 @@ final class Engine: EventTapHandler {
 
     func start() -> Bool {
         if !didSetup {
+            systemDoubleSpacePeriodEnabled = Self.readSystemDoubleSpacePeriodEnabled()
             eventTap.handler = self
             // Смена активного приложения → контекст слова больше не достоверен.
             NSWorkspace.shared.notificationCenter.addObserver(
@@ -224,11 +261,23 @@ final class Engine: EventTapHandler {
                 self?.pendingSoftReset = true
                 self?.refreshFrontmostAppCache()   // inline-путь читает кеш (в колбэке NSWorkspace нельзя)
             }
+            NotificationCenter.default.addObserver(
+                forName: NSSpellChecker.didChangeAutomaticPeriodSubstitutionNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.systemDoubleSpacePeriodEnabled = Self.readSystemDoubleSpacePeriodEnabled()
+            }
             // Выбор сниппета МЫШЬЮ. Ведём в тот же обработчик, что и цифра в перехватчике:
             // одна дорога вставки, а не две.
             SnippetPicker.shared.onPick = { [weak self] idx in
                 guard let text = SnippetPicker.shared.pick(index: idx) else { return }
                 self?.handleSnippetPicked(text)
+            }
+            // Нулевая строка «последняя диктовка» — тот же обработчик, что у её хоткея: одна дорога
+            // вставки, со всеми отказами и защитами, а не вторая копия рядом.
+            SnippetPicker.shared.onPickLastDictation = { [weak self] in
+                guard SnippetPicker.shared.pickLastDictation() else { return }
+                self?.handlePasteDictationHotkey()
             }
             // Открытие и закрытие Spotlight системой не объявляется, поэтому наблюдатель сообщает
             // об этом сам — и дальше всё идёт тем же путём, что и обычная смена программы.
@@ -253,7 +302,8 @@ final class Engine: EventTapHandler {
             refreshFrontmostAppCache()
             TextReplacer.warmUpInline()   // холодный первый burst стоил 23мс (замер 25.07) → греем заранее
             // Точная таблица символов из реальной раскладки (кавычки, Shift-ряд и т.д.).
-            DynamicKeymap.rebuild()
+            DynamicKeymap.rebuild(preferLat: AppSettings.shared.lastLayoutLat,
+                                  preferCyr: AppSettings.shared.lastLayoutCyr)
             KeyboardLayoutCache.refreshOnMain()
             // ДВЕ нотификации, а не одна: Enabled…Changed = изменился СПИСОК раскладок,
             // Selected…Changed = переключили активную. Раньше слушали только первую — при обычном
@@ -262,16 +312,19 @@ final class Engine: EventTapHandler {
             let tisNotes: [CFString] = [kTISNotifyEnabledKeyboardInputSourcesChanged,
                                         kTISNotifySelectedKeyboardInputSourceChanged]
             for n in tisNotes {
+                let isSelectedChange = (n as String) == (kTISNotifySelectedKeyboardInputSourceChanged as String)
                 DistributedNotificationCenter.default().addObserver(
                     forName: NSNotification.Name(n as String), object: nil, queue: .main
                 ) { [weak self] _ in
+                    if isSelectedChange { self?.layout.noteSelectedSourceNotification() }
                     // Аудит C1 (24.07): уведомление прилетает и на НАШИ переключения — чуть позже
                     // по ранлупу, и его стейл-чтение «текущего» перезатирало только что
                     // детерминированно установленные кэш и мнение. В grace-окне своего select'а
                     // правда уже установлена из выбранного объекта — молчим; внешние смены
                     // (без недавнего своего select) обрабатываем как раньше.
                     guard self?.layout.withinOwnSelectGrace != true else { return }
-                    DynamicKeymap.rebuild()
+                    DynamicKeymap.rebuild(preferLat: AppSettings.shared.lastLayoutLat,
+                                  preferCyr: AppSettings.shared.lastLayoutCyr)
                     KeyboardLayoutCache.refreshOnMain()
                     self?.layout.noteExternalLayoutChange()   // память о раскладке — свежим чтением
                     // Человек переключился сам — запоминаем ИМЕННО эту раскладку как его выбор с
@@ -280,9 +333,33 @@ final class Engine: EventTapHandler {
                 }
             }
             // Голосовая вставка завершилась → чистим буфер, чтобы надиктованное не попало в группу (G3).
+            //
+            // ⚠️ НО НЕ ТРОГАЕМ ТО, ЧТО ЧЕЛОВЕК НАБРАЛ САМ, ПОКА МЫ ПЕЧАТАЛИ (жалоба пользователя:
+            // «кликнул в поле, ввёл букву, переключается только со второго раза»). Уборка приходит в
+            // момент КОНЦА нашей вставки, а вставка длинной диктовки идёт секунды: человек за это
+            // время успевает начать своё слово, и мы стирали его вместе с надиктованным контекстом.
+            // В логе это выглядело как «на границе слова буфер пуст», то есть слово исчезало У НАС.
+            //
+            // Диагноз занял три подхода, потому что улики были косвенными: сначала подозревался
+            // запоздалый клик, потом вклинившаяся синтетика — обе версии оставили бы свою строку,
+            // а её не было. Нашлось только когда `clear()` научился писать в лог своего вызывателя.
+            //
+            // Само сообщение везёт время НАЧАЛА вставки. Если после него было настоящее нажатие,
+            // значит в буфере лежит слово ЧЕЛОВЕКА: групповую историю рвём (ради неё уборка и
+            // затевалась), а слово оставляем.
             NotificationCenter.default.addObserver(
                 forName: .keyboopVoiceInserted, object: nil, queue: .main
-            ) { [weak self] _ in self?.liveFixLast = ""; self?.buffer.clear() }
+            ) { [weak self] note in
+                guard let self else { return }
+                self.liveFixLast = ""
+                let startedAt = (note.userInfo?["startedAt"] as? TimeInterval) ?? 0
+                if self.lastRealKeyAt > startedAt {
+                    self.buffer.invalidateGroupHistory()
+                    kbLog("голосовая вставка: человек печатал следом — рву группу, слово оставляю")
+                } else {
+                    self.buffer.clear()
+                }
+            }
             // Прогреть языковые данные в фоне, чтобы первый авто-свап не лагал.
             Warm.prime()
             // Предзаполнить список исключений дефолтами для установленных программ (видеоредакторы/
@@ -351,10 +428,27 @@ final class Engine: EventTapHandler {
     @discardableResult
     private func applyPendingContextClear() -> Bool {
         guard pendingContextClear else { return false }
+        // ⚠️ УСТАРЕВШИЙ ФЛАГ НЕ ЧИСТИТ УЖЕ НАБРАННОЕ (жалоба пользователя: «нажал в поле ввода,
+        // ввёл букву А, не переключается»). Монитор мыши асинхронный: блок про клик выполняется
+        // на главном потоке ПОЗЖЕ, и запросто ложится МЕЖДУ буквой и пробелом. Тогда на пробеле мы
+        // честно чистили буфер вместе с только что набранной буквой, и в логе оставалось «на границе
+        // слова буфер пуст» — то есть слово исчезало у нас, а не у человека.
+        //
+        // Ленивая очистка (16.06) решала соседнюю половину задачи: чтобы clear не съел ПЕРВЫЙ символ.
+        // Эта проверка закрывает вторую: если после клика уже было настоящее нажатие, буфер набран
+        // ПОСЛЕ него и очистке не подлежит. Флаг снимаем, но применяем мягкий сброс: контекст
+        // соседних слов после клика и правда недействителен, а набранное слово — нет.
+        if lastRealKeyAt > contextResetAt {
+            pendingContextClear = false
+            pendingSoftReset = true
+            silentLog("stalectx", "клик пришёл с опозданием, после набора — чищу контекст, но не слово")
+            return false
+        }
         liveFixLast = ""                  // курсор сместился (клик) — якорь self-heal сброшен
         // Каретка прыгнула: слева на экране может стоять целое слово, которого мы не увидим. Для
         // одиночных букв это решающее отличие от чистого начала ввода (см. LayoutDetector, w.count == 1).
         caretJumpedSinceClear = true
+        backspaceSinceJump = false
         buffer.clear()
         UndoLearner.shared.resetContext()
         antiResonance.resetHistory()      // новый контекст — история конверсий неактуальна (заморозка по таймеру сама истечёт)
@@ -363,14 +457,47 @@ final class Engine: EventTapHandler {
         return true
     }
 
-    func handleContextReset() {
+    func handleContextReset(at eventTime: TimeInterval) {
+        contextResetAt = eventTime
         // Клик/навигация двигает курсор — групповая история недействительна даже под muted (G10):
         // нашу синтетику мы шлём только с клавиатуры, mouse-down — всегда намерение пользователя.
         buffer.invalidateGroupHistory()
+        probeCaretLeft()
         if muted { pendingContextClear = true; return }   // клик двигал каретку: очистка не теряется, а ждёт следующего нажатия (аудит-гэп)
         // НЕ чистим буфер ЗДЕСЬ (этот колбэк прилетает с async-монитора ПОЗЖЕ первого нажатия и съедал
         // бы первый символ) — помечаем на ленивую очистку перед следующим нажатием (см. handleKeyDown).
         pendingContextClear = true
+    }
+
+    /// Спросить в фоне, что слева от каретки. Зовётся на КАЖДОМ прыжке каретки, а используется
+    /// только в одном редком случае: первая одиночная буква после этого прыжка (см. `afterJump`).
+    /// Стоит это одного фонового запроса на клик и ничего не стоит главному потоку.
+    private func probeCaretLeft() {
+        caretLeftAtJump = .unknown
+        caretProbeGen &+= 1
+        let gen = caretProbeGen
+        SelectionText.caretLeftAsync { [weak self] answer in
+            DispatchQueue.main.async {
+                guard let self, self.caretProbeGen == gen else { return }   // ответ на прошлый клик — в топку
+                self.caretLeftAtJump = answer
+                // ⚠️ ПЕРВЫЕ ТРИ ОТВЕТА ПИШЕМ В ЛОГ, ДАЛЬШЕ МОЛЧИМ. Проба новая, и без этих строк
+                // нельзя отличить «Accessibility отвечает, слева буква» от «Accessibility молчит
+                // вовсе»: снаружи оба выглядят одинаково — правило прыжка не снялось. Клик бывает
+                // сотни раз за час, поэтому строк ровно три на запуск, этого хватает на проверку.
+                // ⚠️ ОДНА СТРОКА НА ПРОГРАММУ, А НЕ ТРИ НА ЗАПУСК. Первый вариант съедал все три слота
+                // одним приложением (22.08: три подряд от ChatGPT), и про остальные мы не узнавали
+                // ничего. А вопрос тут ровно «где именно Accessibility слеп»: в Electron он молчит,
+                // в нативном поле отвечает, и лечится это по-разному.
+                let appName = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                if !self.caretProbeSeenApps.contains(appName) {
+                    self.caretProbeSeenApps.insert(appName)
+                    let what = answer == .letter ? "слева буква" : (answer == .boundary ? "слева пусто/знак" : "Accessibility не ответил")
+                    // Имя программы обязательно: без него «не ответил» неотличимо у Electron, у web
+                    // и у нативного поля, а лечится это в каждом случае по-разному.
+                    kbLog("проба каретки: \(what) · \(appName)")
+                }
+            }
+        }
     }
 
     // Голосовой ввод (hold-to-talk) — делегируем оркестратору.
@@ -378,8 +505,22 @@ final class Engine: EventTapHandler {
     func handleVoiceEnd() { VoiceController.shared.end() }
 
     /// Возвращает true, если клавишу надо ПРОГЛОТИТЬ (граница слова раскрыла сниппет — см. expandSnippet).
+    ///
+    /// ⚠️ ПАУЗА «НЕ МЕШАТЬ» ГЛУШИТ ТОЛЬКО АВТОМАТИКУ (11.09.2026). Буфер набора на паузе наполняется
+    /// как обычно — иначе ручной конверсии было бы нечего конвертировать, — а вот всё, что
+    /// приложение делает САМО, молчит. Точки, где стоит проверка `Pause.active`, и это полный
+    /// список (добавляешь новое автоматическое действие — добавляй и сюда):
+    ///   1. раскрытие сниппета на границе слова;
+    ///   2. `convertBeforeReturn` — конверсия перед Enter;
+    ///   3. авто-конверсия на границе слова (`convertFromBuffer(manual: false)`);
+    ///   4. `tryInlineLiveFix` — живая починка внутри колбэка тапа;
+    ///   5. планирование `pauseFixTick` и сам тик;
+    ///   6. `handlePauseFixMarker` — исполнение отложенной починки.
+    /// Ручные действия (диктовка и её Escape, конверсия по хоткею, регистр, сниппеты по цифре,
+    /// мгновенное переключение) проверок не имеют и на паузе работают.
     @discardableResult
     func handleKeyDown(keyCode: Int64, characters: String, flags: CGEventFlags,
+                       eventTime: TimeInterval = ProcessInfo.processInfo.systemUptime,
                        post: ((CGEvent) -> Void)? = nil) -> Bool {
         // ВАЖНО: больше НЕ гейтим реальный ввод по muted — наша синтетика отсеивается тегом в EventTap
         // (kbSyntheticMarker), а реальные нажатия должны копиться в буфер ВСЕГДА, даже пока летит наша
@@ -428,11 +569,14 @@ final class Engine: EventTapHandler {
             } else {
                 buffer.backspace()
                 wordEdited = true                    // юзер правит слово внутри → live-fix молчит до границы
+                if caretJumpedSinceClear { backspaceSinceJump = true }   // правка после клика, см. задачу 187
                 UndoLearner.shared.observe(current: buffer.currentWord)   // U2: следим за стиранием нашего вывода
             }
         case 49, 48, 36: // Space, Tab, Return — граница слова
             liveFixLast = ""                          // слово завершено — якорь self-heal сброшен
             wordEdited = false                        // новое слово начинается свежим — live-fix снова активен
+            let boundaryHandledAt = ProcessInfo.processInfo.systemUptime
+            lastRealKeyAt = boundaryHandledAt         // второй пробел тоже закрывает Fence A
             let ws = keyCode == 48 ? "\t" : (keyCode == 36 ? "\n" : " ")
             // СНИППЕТ: проверяем ТЕКУЩЕЕ слово ДО boundary (currentWord = триггер, как на экране).
             // Совпало → ГЛОТАЕМ клавишу-границу и раскрываем сами. Не пускаем пробел в приложение →
@@ -459,7 +603,7 @@ final class Engine: EventTapHandler {
             // refreshFrontmostAppCache). Сегодня я уже уронил весь ввод в системе, положив дорогой
             // вызов на горячий путь, — второй раз не надо.
             let snipAllowed = frontAppMode != "off" && !(settings.developerMode && frontAppIsDev)
-            if snipKeyOK, snipAllowed, !muted, !buffer.currentWord.isEmpty,
+            if snipKeyOK, snipAllowed, !muted, !Pause.active, !buffer.currentWord.isEmpty,
                let expansion = SnippetStore.shared.expansion(forTyped: buffer.currentWord) {
                 expandSnippet(trigger: buffer.currentWord, expansion: expansion, whitespace: ws)
                 return true   // граница проглочена — в приложение не уходит
@@ -470,7 +614,10 @@ final class Engine: EventTapHandler {
             if keyCode == 36, convertBeforeReturn(flags: flags) {
                 return true   // Enter проглочен — уйдёт синтетикой строго после замены
             }
-            buffer.boundary(ws)
+            buffer.boundary(ws, at: eventTime)
+            // Space/Tab/Enter — тоже реальный текстовый ввод. Раньше Fence B видел только буквы,
+            // поэтому второй пробел внутри синтетической замены оставлял модель буфера ложной.
+            if muted { inFlightRealKeys += 1 }
             // Авто-раскладка срабатывает только по разрешённым клавишам-триггерам.
             var autoTrigger = (keyCode == 49 && settings.triggerSpace)
                            || (keyCode == 36 && settings.triggerEnter)
@@ -511,7 +658,7 @@ final class Engine: EventTapHandler {
                     self.buffer.clear()
                     return
                 }
-                guard autoTrigger, self.settings.autoEnabled else { return }
+                guard autoTrigger, self.settings.autoEnabled, !Pause.active else { return }
                 // Fence A (аудит): юзер уже печатает следующее слово — не стреляем синтетикой в
                 // разгар набора (реальная клавиша между нашими backspace'ами = «gприветhello»).
                 // ОДНА отсрочка 40мс; печатает и дальше — стреляем всё равно (completedOnly-цель
@@ -568,7 +715,7 @@ final class Engine: EventTapHandler {
                 // в буфере — после неё → буфер ≠ экран → детектор судит не то, что видно. Теперь
                 // live-fix стреляет через 150мс ТИШИНЫ: пальцы замерли — синтетике никто не мешает.
                 // На границе слова (пробел/Enter) конверсия как была — без задержки.
-                if settings.liveFixEnabled && settings.autoEnabled {
+                if settings.liveFixEnabled && settings.autoEnabled && !Pause.active {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.pauseFixTick() }
                 }
             }
@@ -619,8 +766,12 @@ final class Engine: EventTapHandler {
     /// Обновляется на смене активного приложения (наблюдатель уже есть в start()).
     private var frontAppMode = ""
     private var frontAppIsDev = false
+    /// Только для лога решений. Имя (`localizedName`) тут звать нельзя — это NSWorkspace на горячем
+    /// пути, а bundle id уже посчитан строкой ниже и стоит ноль.
+    private var frontAppBID = ""
     func refreshFrontmostAppCache() {
         let bid = Engine.frontmostBundleID()
+        frontAppBID = bid
         // ⚠️ ЧЕРЕЗ ОБЩИЙ ИСТОЧНИК, не напрямую в ExceptionStore. Здесь живёт кэш для ГОРЯЧЕГО пути
         // (мид-слово, pause-fix), и когда 30.07 мы исключили собственные окна в frontmostAppMode,
         // эта строка тихо осталась в обход — то есть правка закрыла границу слова, но не закрыла
@@ -630,6 +781,11 @@ final class Engine: EventTapHandler {
         frontAppIsChromium = Engine.chromiumFamily.contains(bid)
             || bid.hasPrefix("com.microsoft.edgemac") || bid.hasPrefix("org.chromium")
             || bid.hasPrefix("com.electron") || bid.hasPrefix("com.tinyspeck")
+        // Chromium и Electron съедают ПЕРВОЕ наше клавиатурное событие после хоткея (доказано в
+        // живой Figma 08.09.2026, разбор в TextReplacer.primeFirstKey). Ставим флаг здесь, потому
+        // что здесь и так считается семейство, а `TextReplacer` статический и активного приложения
+        // не знает. Один раз на смену фокуса — в горячий путь ничего не добавляется.
+        TextReplacer.primeFirstKey = frontAppIsChromium || Engine.isElectronApp(NSWorkspace.shared.frontmostApplication)
         // ⚠️ НЕ удлинять паузу перед первым Backspace для Chromium/Electron (пробовали 25.07: 9→40мс).
         // Симптом «остаётся первая буква» — это НЕ поздний backspace, а ГОНКА: пока летит асинхронная
         // пачка (пауза + бэкспейсы + Unicode), пользователь успевает нажать следующую клавишу, и она
@@ -809,6 +965,8 @@ final class Engine: EventTapHandler {
     /// Таймер паузы (150мс тишины). Дешёвые проверки + AX-фантом (ему не место в колбэке тапа:
     /// AX-IPC до десятков мс — риск таймаута) → постим пустышку.
     private func pauseFixTick() {
+        // Пауза «Не мешать»: тик мог быть запланирован за миг до её включения — не стреляем.
+        guard !Pause.active else { return }
         // ⚠️ ДВЕ РАЗНЫЕ ПРИЧИНЫ, И ОТКАТ У НИХ РАЗНЫЙ (разделено 31.07). Раньше здесь стоял один
         // гард на оба случая, и оба падали в maybeLiveFix() — асинхронный мид-словный путь.
         //   • Человек сам выключил тумблер → он попросил старое поведение, отдаём maybeLiveFix.
@@ -838,7 +996,12 @@ final class Engine: EventTapHandler {
         // Только в grace-окне нашего же переключения; AX зовём здесь, на main, не в колбэке.
         if layout.withinOwnSelectGrace, !word.hasCyrillic || !word.hasLatinLetter,
            case .convert(let toCyr) = LayoutDetector.liveDecide(word: word) {
-            let converted = Keymap.smartConvert(word, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator)
+            // ⚠️ Концевой знак, который в раскладке человека буква («.» на «ю»), ещё не решён: ждём
+            // следующую клавишу, пустышку не шлём (задача 262, 26.09.2026, см. `Keymap.liveConvert`).
+            guard let converted = Keymap.liveConvert(word, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator) else {
+                kbLog("live: жду следующую букву, концевой знак = буква (pause-tick, len \(word.count))")
+                return
+            }
             if converted != word, AXScreenCheck.caretEndsWith(converted) == true {
                 kbLog("фантом предотвращён (pause-fix): на экране уже итог (AX), len \(converted.count)")
                 buffer.applyConversion(converted: converted)
@@ -854,6 +1017,12 @@ final class Engine: EventTapHandler {
         e.setIntegerValueField(.eventSourceUserData, value: kbPauseFixMarker)
         pauseFixMarkerPostedAt = ProcessInfo.processInfo.systemUptime
         pauseFixSentCount &+= 1
+        // ⚠️ ИМЕННО `.cghidEventTap`, и менять нельзя (11.09.2026). Печатающая синтетика уехала на
+        // `.cgAnnotatedSessionEventTap`, чтобы её не съедали чужие активные перехватчики на ступени
+        // session (см. `TextReplacer.synthPostTap`). У пустышки смысл ПРОТИВОПОЛОЖНЫЙ: она нужна
+        // ровно затем, чтобы её поймал и проглотил НАШ тап, а он стоит на session. Отправь её ниже —
+        // и она пролетит мимо нас прямо в приложение, паузная правка перестанет случаться, а
+        // виртуальный код 255 молча ничего не напечатает. Отказ был бы полностью беззвучным.
         e.post(tap: .cghidEventTap)
     }
 
@@ -869,7 +1038,7 @@ final class Engine: EventTapHandler {
         if pauseFixGotCount % 10 == 1 {
             kbLog("pause-fix: пустышек отправлено \(pauseFixSentCount), дошло \(pauseFixGotCount)")
         }
-        guard settings.inlineLiveFix, inlineHealthy, settings.liveFixEnabled, settings.autoEnabled else { return }
+        guard settings.inlineLiveFix, inlineHealthy, settings.liveFixEnabled, settings.autoEnabled, !Pause.active else { return }
         guard Warm.isReady, !muted, !wordEdited else { return }
         guard ProcessInfo.processInfo.systemUptime - lastRealKeyAt >= 0.14 else { return }
         guard !frontAppIsDev || !settings.developerMode else { return }
@@ -913,7 +1082,11 @@ final class Engine: EventTapHandler {
         }
         // Ветка 2: обычная конверсия — зеркало tryInlineLiveFix, только без pendingChar.
         guard case .convert(let toCyr) = LayoutDetector.liveDecide(word: word) else { return }
-        let converted = Keymap.smartConvert(word, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator)
+        // Задача 262: концевой знак-буква («.» на «ю») ещё не решён, ждём следующую клавишу.
+        guard let converted = Keymap.liveConvert(word, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator) else {
+            kbLog("live: жду следующую букву, концевой знак = буква (pause-fix, len \(word.count))")
+            return
+        }
         guard converted != word else { return }
         guard antiResonance.allow(word: word, produced: converted) else {
             liveFixLast = ""; buffer.clear(); return
@@ -936,7 +1109,7 @@ final class Engine: EventTapHandler {
     }
 
     private func tryInlineLiveFix(pendingChar: String, pendingKeyCode: Int64, flags: CGEventFlags, post: (CGEvent) -> Void) -> Bool {
-        guard settings.inlineLiveFix, inlineHealthy, settings.liveFixEnabled, settings.autoEnabled else { return false }
+        guard settings.inlineLiveFix, inlineHealthy, settings.liveFixEnabled, settings.autoEnabled, !Pause.active else { return false }
         guard Warm.isReady, !muted, !wordEdited else { return false }   // F7: асинхронная синтетика в полёте → молчим
         guard !frontAppIsDev || !settings.developerMode else { return false }
         guard frontAppMode.isEmpty else { return false }          // приложение в исключениях (off/soft)
@@ -960,7 +1133,13 @@ final class Engine: EventTapHandler {
         guard candidate != liveFixLast else { return false }
         guard !candidate.hasCyrillic || !candidate.hasLatinLetter else { return false }  // смешанное — не наш случай
         guard case .convert(let toCyr) = LayoutDetector.liveDecide(word: candidate) else { return false }
-        let converted = Keymap.smartConvert(candidate, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator)
+        // ⚠️ ЗАДАЧА 262 (отзыв #312, 26.09.2026): «gthtrk.» это недописанное «переклю…», а не «перекл»
+        // с точкой. Если концевой знак в раскладке человека буква, не стреляем: следующая клавиша
+        // сделает его внутренним. Клавиша при этом уходит в приложение как обычно.
+        guard let converted = Keymap.liveConvert(candidate, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator) else {
+            kbLog("live: жду следующую букву, концевой знак = буква (inline, len \(candidate.count))")
+            return false
+        }
         guard converted != candidate else { return false }
         guard antiResonance.allow(word: candidate, produced: converted) else {
             liveFixLast = ""; buffer.clear(); return false
@@ -1043,7 +1222,11 @@ final class Engine: EventTapHandler {
             return
         }
         guard case .convert(let toCyr) = LayoutDetector.liveDecide(word: word) else { return }
-        let converted = Keymap.smartConvert(word, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator)
+        // Задача 262: концевой знак-буква («.» на «ю») ещё не решён, ждём следующую клавишу.
+        guard let converted = Keymap.liveConvert(word, toCyrillic: toCyr, isValidTarget: Self.ruWordValidator) else {
+            kbLog("live: жду следующую букву, концевой знак = буква (live-fix, len \(word.count))")
+            return
+        }
         guard converted != word else { return }
         // Предохранитель от резонанса: осцилляция этого места → стоп, разрываем цикл (чистим буфер).
         guard antiResonance.allow(word: word, produced: converted) else {
@@ -1087,47 +1270,27 @@ final class Engine: EventTapHandler {
         }
     }
 
-    /// 🌐/Fn/⇪: ТОЛЬКО смена языка, набранное не трогаем (в отличие от хоткея конвертации).
+    /// 🌐/Fn/⇪: ТОЛЬКО смена раскладки, набранное не трогаем (в отличие от хоткея конвертации).
     /// Ровно поведение системной клавиши, но без её задержки — мы срабатываем по факту
     /// чистого отпускания, а macOS ждёт, не начало ли это комбинации.
     ///
-    /// Направление считаем от ПАМЯТИ (currentIsCyrillicOpinion), а не от сырого TIS-чтения:
-    /// баг стейл-кэша давал «→ EN» ×6 подряд — каждое нажатие читало устаревший RU и «переключало»
-    /// туда же (баг-репорт, разбор в LayoutManager.opinionCyr).
+    /// Цикл идёт по всем включённым select-capable источникам в системном порядке и по полному
+    /// TIS ID. Точная память LayoutManager не даёт быстрым нажатиям повторять один источник из-за
+    /// стейл-чтения TIS.
     func handleLayoutSwitchOnly() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let curCyr = self.layout.currentIsCyrillicOpinion()
-            let toCyr = !curCyr
-            guard self.layout.selectLayout(cyrillic: toCyr) else {
-                kbLog("globe: НЕ переключил — среди включённых раскладок нет \(toCyr ? "RU" : "EN")")
+            guard self.layout.cycleLayout() else {
+                kbLog("globe: НЕ переключил — среди включённых нет раскладок для цикла")
                 return
             }
-            // Слово оборвано сменой языка: дальше пойдут символы другого алфавита, и старый
+            // Слово оборвано сменой раскладки: дальше пойдут символы другого алфавита, и старый
             // префикс в буфере сделал бы из них «смешанное» слово. Начинаем с чистого листа.
             self.liveFixLast = ""
             self.buffer.clear()
             self.onLayoutMaybeChanged?()
             // Звук НЕ играем (просьба автора 24.07): это замена системной смены языка, а она
             // молчит. Индикатор в строке меню и так показывает текущий язык.
-            // ⚠️ ДИАГНОСТИКА ИНВЕРТИРОВАННОГО СИСТЕМНОГО ЗНАЧКА (баг-репорт: «переключаю на
-            // русский, а macOS показывает у каретки латинскую A»). Значок рисует САМА система, мы у
-            // каретки ничего не рисуем, значит она показывает то состояние, которое у неё на руках.
-            // Направление мы считаем от ПАМЯТИ (opinionCyr), а не от чтения TIS, и если память
-            // разошлась с реальностью, мы «переключаем» туда, где уже находимся: система показывает
-            // значок, а раскладка не меняется, и выглядит это ровно как инверсия.
-            // Поэтому пишем три величины разом: мнение, реальность ДО и реальность ПОСЛЕ.
-            let realBefore = self.layout.currentIsCyrillic()
-            kbLog("globe: язык переключён \(curCyr ? "RU" : "EN") → \(toCyr ? "RU" : "EN")"
-                  + " · мнение=\(curCyr ? "RU" : "EN") реальность до=\(realBefore ? "RU" : "EN")")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                guard let self else { return }
-                let realAfter = self.layout.currentIsCyrillic()
-                kbLog("globe: реальность через 250мс = \(realAfter ? "RU" : "EN")"
-                      + (realAfter == toCyr ? " (совпало с намерением)" : " ⚠️ НЕ совпало с намерением"))
-            }
-            // (300мс-диагностику стейл-чтения убрали: механизм подтверждён и уже обслуживается
-            //  opinionCyr + reconcileWithReality; лишний TIS-read на main под globe-шторм не нужен.)
         }
     }
 
@@ -1148,6 +1311,11 @@ final class Engine: EventTapHandler {
         let sel = SelectionText.read()
         muted = false
         guard let (text, writeBack) = sel else { kbLog("translate: выделение не прочитано"); Sounds.beep(); return }
+        // ⚠️ Многострочное выделение в Gecko не трогаем (задача 265, разбор у `SelectionText.AXWritePath`):
+        // AX-запись у Firefox портит текст вокруг, а печать переводов строк туда не проверена.
+        if SelectionText.lastReadRefusedMultiline {
+            kbLog("translate: отказ, в выделении Gecko перевод строки или встроенный объект — не трогаю"); Sounds.beep(); return
+        }
         let dir = TranslateDirection.of(text)
         kbLog("translate: \(text.count) симв. \(dir.from)→\(dir.to)…")
         Task { @MainActor in
@@ -1169,13 +1337,17 @@ final class Engine: EventTapHandler {
                   t != text else { kbLog("translate: пусто/без изменений"); return }
             self.playTranslateSound()                 // звук — ТОЛЬКО когда реально перевели
             self.muted = true
-            if !(writeBack?(t) ?? false) {
+            let viaAX = writeBack?(t) ?? false
+            if !viaAX {
                 TextReplacer.insert(t) { [weak self] in
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.muted = false; self?.drainPendingManual() }
                 }
             } else {   // запись через AX (синтетику не постим) — снимаем muted по таймеру как раньше
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.muted = false; self?.drainPendingManual() }
             }
+            // Путь записи в лог, как у смены регистра (26.09.2026, отзыв #312): без него не отличить
+            // AX-запись от печати и не увидеть двойную печать.
+            kbLog("translate: \(t.count) симв. записано \(viaAX ? "через AX" : "печатью") в \(Engine.frontmostBundleID())")
             self.buffer.clear()
         }
         #endif
@@ -1186,6 +1358,99 @@ final class Engine: EventTapHandler {
     func handleCaseHotkey() {
         kbLog("регистр: хоткей нажат")
         DispatchQueue.main.async { [weak self] in self?.changeSelectionCase() }
+    }
+
+    /// ВСТАВИТЬ ПОСЛЕДНЮЮ ДИКТОВКУ (задача 242, отзыв #245 от 05.09.2026).
+    ///
+    /// Жалоба дословно: «надиктовал, нажал „Завершить диктовку“, текст вставился, но курсор по
+    /// какой-то причине оказался не в том поле ввода». Спасало только «Скопировать последнюю
+    /// диктовку» в меню плюс ручная вставка, то есть поход в строку меню в момент, когда человек
+    /// уже потерял результат.
+    ///
+    /// Путь вставки тот же, что у сниппета по хоткею: печать в текущее поле, буфер обмена не
+    /// трогаем вовсе (принцип №1). Свой буфер набора чистим — вставленный текст не наш ввод, и
+    /// достраивать по нему конверсию нельзя.
+    func handlePasteDictationHotkey() {
+        kbLog("последняя диктовка: запрошена вставка")   // путей два: свой хоткей и нулевая строка панели
+        DispatchQueue.main.async { [weak self] in self?.pasteLastDictation() }
+    }
+
+    private func pasteLastDictation() {
+        // Наша же синтетика ещё летит (или летит чужая наша замена) — второе нажатие в очередь не
+        // ставим. Тот же guard, что у перевода: две печати внахлёст перемешали бы текст.
+        // Через СТОРОЖ, а не по сырому флагу: если completion синтетики когда-то потерялся (такое
+        // было, репорт 24.07), сырой `muted` остался бы поднятым, и функция молча умерла бы до
+        // ближайшего набора текста — сторож снимает залипший флаг через 1.2 с и пишет об этом.
+        guard !mutedStuckCheck() else { kbLog("последняя диктовка: синтетика в полёте, пропускаю"); return }
+        // Пока идёт запись или расшифровка, свежая диктовка ЕЩЁ НЕ в истории (она ложится туда
+        // после доставки текста), и `lastVisible()` отдал бы предыдущую. Человек нажимает хоткей
+        // как раз в этот момент — он видит, что текст не появился, — и получил бы вчерашний текст,
+        // а через секунду в то же поле приехал бы свежий.
+        if VoiceController.shared.isBusyWithDictation {
+            VoiceIndicator.shared.showToast(L10n.t("voice.pasteLastBusy"))
+            kbLog("последняя диктовка: идёт запись или расшифровка, вставлять рано")
+            return
+        }
+        // ⚠️ ПОД ПАРОЛЕМ НЕ ВСТАВЛЯЕМ, И ЭТО НЕ ЛЕНЬ. `HistoryGate.promptUnlock` показывает NSAlert
+        // и делает `NSApp.activate(ignoringOtherApps:)`, то есть забирает фокус у чужого окна —
+        // ровно у того поля, куда человек и хотел вставить. После закрытия алерта каретки там уже
+        // нет, и вставка ушла бы неизвестно куда. Гонку с возвратом фокуса чужому приложению этот
+        // проект не заводит принципиально (см. SnippetPicker: панель не активируется вовсе).
+        // Поэтому честно говорим словами: история под паролем, открой окно истории.
+        if HistoryGate.enabled {
+            VoiceIndicator.shared.showToast(L10n.t("voice.pasteLastLocked"))
+            kbLog("последняя диктовка: не вставляем, история под паролем")
+            return
+        }
+        // История выключена — вставлять просто нечего, и сказать это надо отдельно от «диктовок ещё
+        // не было»: иначе человек будет диктовать снова и снова, а причина в тумблере.
+        guard settings.voiceHistoryEnabled else {
+            VoiceIndicator.shared.showToast(L10n.t("voice.pasteLastNoHistory"))
+            kbLog("последняя диктовка: история диктовок выключена")
+            return
+        }
+        // Активны МЫ — значит каретка стоит в нашем же окне (настройки, история, форма отзыва), и
+        // синтетика ушла бы в наше поле: в поиск по истории, в поле сниппета, в форму. Печатать
+        // туда чужой длинный текст нельзя, а угадывать «наверное, он хотел в предыдущее окно» —
+        // это ровно та гонка с возвратом фокуса, которую проект не заводит. Говорим словами.
+        if NSApp.isActive {
+            VoiceIndicator.shared.showToast(L10n.t("voice.pasteLastOurWindow"))
+            kbLog("последняя диктовка: активно наше окно, не вставляю")
+            return
+        }
+        guard let text = VoiceHistory.shared.lastVisible()?.text, !text.isEmpty else {
+            // Два разных «пусто», и путать их нельзя: «уже удалена по сроку» человеку, который не
+            // диктовал ни разу, ничего не объясняет и посылает искать несуществующую запись.
+            let expired = VoiceHistory.shared.hasAnyDictation
+            VoiceIndicator.shared.showToast(L10n.t(expired ? "menu.copyLastEmpty" : "voice.pasteLastNever"))
+            kbLog("последняя диктовка: нечего вставлять (\(expired ? "просрочена" : "ни одной"))")
+            return
+        }
+        // ⚠️ СПРАШИВАЕМ ПРО SECURE INPUT САМИ, ХОТЯ ЭТО ЖЕ ДЕЛАЕТ `insert`. Внутри `insert` отказ
+        // виден только в логе: completion зовётся одинаково и при удаче, и при отказе, поэтому без
+        // своей проверки строка «вставлено N симв.» печаталась бы даже там, где не вставилось
+        // ничего. Врущий лог хуже отсутствующего — правило проекта. Мы на главном потоке из
+        // async-обёртки, не в колбэке тапа: цена AX-запроса здесь та же, что у `VoiceController`
+        // перед доставкой диктовки.
+        guard SecureInputPolicy.canWrite("вставка последней диктовки \(text.count) симв.") else {
+            VoiceIndicator.shared.showToast(L10n.t("voice.pasteLastSecure"))
+            kbLog("последняя диктовка: Secure Input не даёт писать")
+            return
+        }
+        buffer.clear()
+        liveFixLast = ""
+        // Полёт синтетики объявляем как все остальные пути замены: пока идёт печать, живая починка
+        // молчит, вклинившиеся реальные клавиши считает Fence B, а `endSyntheticFlight` сам решает,
+        // чистить ли буфер. Без этого длинная диктовка печаталась бы «вслепую» для всех защит.
+        // Замер длительности, чтобы сторож застревания (`mutedStuckCheck`, 1.2 с) не сработал
+        // посреди честной вставки: `typeUnicode` шлёт 12 единиц UTF-16 на кусок с паузой 800 мкс,
+        // то есть около 15 000 символов в секунду. Пятиминутная диктовка это 4–5 тысяч символов и
+        // треть секунды; в 1.2 с не влезет только текст на 18 тысяч знаков, а такие приходят из
+        // импорта файлов, который в «последнюю диктовку» не попадает по построению (lastDictation
+        // отдаёт только kind == .dictation).
+        muted = true
+        TextReplacer.insert(text) { [weak self] in self?.endSyntheticFlight() }
+        kbLog("последняя диктовка: вставляю \(text.count) симв.")   // только длина, принцип №2
     }
 
     /// СМЕНА РЕГИСТРА ВЫДЕЛЕННОГО ТЕКСТА (задача 122).
@@ -1223,6 +1488,12 @@ final class Engine: EventTapHandler {
         guard let (text, writeBack) = sel, !text.isEmpty else {
             kbLog("регистр: выделение не прочитано"); Sounds.beep(); return
         }
+        // ⚠️ Единственное исключение из «многострочность разрешена» (задача 265, 26.09.2026): Gecko.
+        // AX-запись у Firefox портит текст вокруг выделения, поэтому там пишем печатью, а печать
+        // переводов строк в Firefox не проверена. Разбор — у `SelectionText.AXWritePath`.
+        if SelectionText.lastReadRefusedMultiline {
+            kbLog("регистр: отказ, в выделении Gecko перевод строки или встроенный объект — не трогаю"); Sounds.beep(); return
+        }
         guard text.count <= Self.caseChangeMaxChars else {
             kbLog("регистр: отклонено, \(text.count) симв. — это больше похоже на случайное ⌘A")
             Sounds.beep(); return
@@ -1235,15 +1506,21 @@ final class Engine: EventTapHandler {
         muted = true
         let usedSynth = !(writeBack?(changed) ?? false)
         if usedSynth {
+            // ⚠️ ЗВУК ПОСЛЕ ОТПРАВКИ, А НЕ ДО НЕЁ. Раньше он играл здесь же, на главном потоке, ещё
+            // до того, как задание попадало в очередь синтетики: то есть подтверждал не результат, а
+            // намерение. В приложениях, которые нашу Unicode-вставку принимают плохо (Chromium и
+            // родня, `chromiumFamily`), это и звучит как «звук был, текст не изменился».
+            // `completion` у `insert` зовётся всегда, поэтому звук не потеряется.
             TextReplacer.insert(changed) { [weak self] in
+                self?.playSound()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.muted = false; self?.drainPendingManual() }
             }
         } else {
+            playSound()   // AX-путь: приложение уже подтвердило запись
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.muted = false; self?.drainPendingManual() }
         }
         buffer.clear()
-        playSound()
-        kbLog("регистр: \(text.count) симв. → \(toUpper ? "ЗАГЛАВНЫЕ" : "строчные") (\(usedSynth ? "печатью" : "через AX"))")
+        kbLog("регистр: \(text.count) симв. → \(toUpper ? "ЗАГЛАВНЫЕ" : "строчные") (\(usedSynth ? "печатью" : "через AX")) в \(Engine.frontmostBundleID())")
     }
 
     /// Потолок на объём. Не защита от больших заголовков, а защита от ⌘A: перевести в верхний
@@ -1286,6 +1563,44 @@ final class Engine: EventTapHandler {
         // выделение заведомо настоящее. Раньше мы отказывались и там — и человек не мог починить
         // выделенный абзац, набранный не в той раскладке, хотя это как раз частый случай.
         let isClipboard = (writeBack == nil)
+        // ⚠️ МНОГОСТРОЧНОЕ В GECKO — ОТКАЗ, как в буферном пути (задача 265, 26.09.2026). Выделение
+        // настоящее (прочитано через AX), но записать его нечем: AX-запись у Firefox портит текст
+        // вокруг, а печать переводов строк туда не проверена. Разбор — у `SelectionText.AXWritePath`.
+        // selectionRefused: человек указал на текст, делать вместо него что-то другое нельзя.
+        if SelectionText.lastReadRefusedMultiline {
+            muted = false
+            selectionRefused = true
+            kbLog("convert-selection: отклонено (\(text.count) симв., в Gecko перевод строки или встроенный объект) — ничего не делаю")
+            return false
+        }
+        // ВЫДЕЛЕН ОБЪЕКТ НА ХОЛСТЕ (Figma). Отдельная ветка ДО предохранителя, потому что по форме
+        // текста этот случай от «⌘C без выделения скопировал строку кода» неотличим: и там, и там
+        // одна строка с переводом в конце. Отличает только доказательство в буфере — данные объекта
+        // Figma рядом с простым текстом (см. SelectionText.lastCopyLooksLikeCanvasNode). Без этого
+        // доказательства мы ничего не меняем и падаем в тот же отказ, что и раньше.
+        //
+        // Многострочный объект пока не берём: печать переводов строки внутри холста это отдельный
+        // разговор (Enter там уже занят входом в текст), а отзыв был про однострочные заголовки.
+        if isClipboard, SelectionText.lastCopyLooksLikeCanvasNode, TextReplacer.primeFirstKey,
+           text.hasSuffix("\n"), !text.dropLast().contains("\n"), !text.contains("\r"),
+           text.count <= Self.canvasObjectMaxChars {
+            let body = String(text.dropLast())
+            let toCyr: Bool
+            if body.hasCyrillic { toCyr = false } else if body.hasLatinLetter { toCyr = true } else { muted = false; return false }
+            let out = Keymap.convert(body, toCyrillic: toCyr)
+            guard out != body else { muted = false; return false }
+            TextReplacer.replaceCanvasObjectText(out) { [weak self] in
+                guard let self else { return }
+                self.layout.selectLayout(cyrillic: toCyr)
+                self.onLayoutMaybeChanged?()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.muted = false; self.drainPendingManual() }
+            }
+            settings.rescuedCount += max(1, body.split(separator: " ").count)
+            buffer.clear()
+            playSound()
+            kbLog("convert-selection: объект холста, \(body.count) симв. → \(toCyr ? "RU" : "EN")")
+            return true
+        }
         if (isClipboard && (text.contains("\n") || text.contains("\r") || text.count > 80)) {
             muted = false
             selectionRefused = true   // выделение БЫЛО — значит трогать что-то ещё нельзя (см. ниже)
@@ -1295,27 +1610,64 @@ final class Engine: EventTapHandler {
         let toCyrillic: Bool
         if text.hasCyrillic { toCyrillic = false }
         else if text.hasLatinLetter { toCyrillic = true }
-        else { muted = false; return false }          // нет букв — нечего переключать
+        else if let bySymbols = Keymap.unambiguousSymbolDirection(text) {
+            // ВЫДЕЛЕНИЕ БЕЗ БУКВ, ОДНИ ЗНАКИ (задача 268, отзыв #267 от 12.09.2026). Раньше здесь
+            // стоял безусловный отказ «нет букв — нечего переключать», и человек, набравший `^`
+            // вместо запятой, выделял его, жал хоткей и не получал ничего. Направление для знаков
+            // выводится не из букв, а из однозначности самого знака, разбор — у
+            // `Keymap.unambiguousSymbolDirection`. Спорные знаки по-прежнему не трогаем.
+            toCyrillic = bySymbols
+        }
+        else {
+            muted = false
+            kbLog("convert-selection: в выделении нет букв, а знаки спорные — не трогаю")
+            return false
+        }
         let converted = Keymap.convert(text, toCyrillic: toCyrillic)
         guard converted != text else { muted = false; return false }
         let usedSynth = !(writeBack?(converted) ?? false)
+        // Раскладку переключаем ПОСЛЕ печати, а не одновременно с ней.
+        //
+        // ⚠️ ЧЕСТНО: сделано по гипотезе, которая НЕ подтвердилась. Я думал, что первый кусок
+        // Unicode-вставки теряется в Figma из-за того, что `TISSelectInputSource` выполняется на
+        // главном потоке ровно тогда, когда `insert` уже печатает со своей очереди. Перенёс — и в
+        // живой Figma ничего не изменилось, «егодня» осталось «егодня». Настоящая причина другая
+        // и лечится в другом месте (см. `TextReplacer.primeFirstKey`).
+        //
+        // Оставляю всё равно: одновременная смена источника ввода и печать это гонка сама по себе,
+        // а платы за перенос нет — текст печатается Unicode-строкой и от раскладки не зависит,
+        // переключение нужно для того, что человек будет набирать ПОСЛЕ. Разница в две миллисекунды.
+        let switchLayoutAfterwards = { [weak self] in
+            guard let self else { return }
+            self.layout.selectLayout(cyrillic: toCyrillic)
+            self.onLayoutMaybeChanged?()
+        }
         if usedSynth {
             TextReplacer.insert(converted) { [weak self] in   // печатаем поверх выделения (Unicode)
+                switchLayoutAfterwards()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.muted = false; self?.drainPendingManual() }
             }
+        } else {
+            switchLayoutAfterwards()   // AX-путь: приложение уже приняло текст, гонки нет
         }
         // выделение могло быть из нескольких слов — считаем по словам
         settings.rescuedCount += max(1, text.split(separator: " ").count)
-        layout.selectLayout(cyrillic: toCyrillic)
-        onLayoutMaybeChanged?()
         buffer.clear()
         playSound()                                   // звук конвертации — подтверждение действия
-        kbLog("convert-selection: \(text.count) симв. → \(toCyrillic ? "RU" : "EN")")
+        // Путь записи в лог (26.09.2026, отзыв #312), как у смены регистра: иначе не отличить
+        // AX-запись от печати поверх выделения и не увидеть двойную печать.
+        kbLog("convert-selection: \(text.count) симв. → \(toCyrillic ? "RU" : "EN") (\(usedSynth ? "печатью" : "через AX"))")
         if !usedSynth {   // запись через AX — снимаем muted по таймеру
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.muted = false; self?.drainPendingManual() }
         }
         return true
     }
+
+    /// Потолок для замены текста объекта на холсте. Больше обычных 80 символов буферного пути:
+    /// там кап защищает от случайно скопированной строки, а здесь мы ЗНАЕМ, что человек выделил
+    /// объект намеренно. Но и не бесконечность: печатаем посимвольно, и длинный абзац это заметная
+    /// пауза, в которую человек успеет нажать что-то своё.
+    private static let canvasObjectMaxChars = 300
 
     /// Групповая конвертация нескольких слов сессии набора одним хоткеем (эксперимент, groupConvert).
     /// КЛЮЧЕВОЕ (ключевая идея H): конвертируем ПОСЛОВНО только те слова, что LayoutDetector
@@ -1392,6 +1744,14 @@ final class Engine: EventTapHandler {
         // недействителен. Авто (manual=false) НЕ трогаем — оно не должно стирать якорь набираемого
         // следующего слова (ревью 2026-06-19, закрытие residual-гэпа #2).
         if manual { liveFixLast = "" }
+        // ⚠️ ПЕРВОЕ НАЖАТИЕ ОТМЕНЯЕТ НАШУ ПРАВКУ ТЕКСТА, И ТОЛЬКО ПОТОМ РАБОТАЕТ КОНВЕРСИЯ
+        // (просьба автора 20.08, повод — отзыв #156). Человек набрал «iOS», мы сделали «Ios», он нажал
+        // привычное «верни как было» и получил «Шщы»: сочетание честно переключило раскладку, только
+        // вернуть он хотел не раскладку, а наше вмешательство.
+        //
+        // Порядок именно такой: сначала отмена, потом всё остальное. Пока на слове висит наша
+        // правка, человек почти наверняка целится в неё; когда правки нет, поведение прежнее.
+        if manual, undoLastTextFix() { return }
         // ПОРЯДОК ВАЖЕН (фикс бага #39): если буфер НЕ пуст (только что печатали) — чиним именно
         // набранное слово, выделение НЕ трогаем. Иначе Cmd+C в редакторах/терминалах при ПУСТОМ
         // выделении копирует ЦЕЛУЮ СТРОКУ → раньше конвертило 150 символов вместо последнего слова.
@@ -1408,7 +1768,8 @@ final class Engine: EventTapHandler {
         // молча no-op'ала, а завершённое слово сиротело («иногда не переключается» у быстрых рук).
         guard let item = buffer.wordForConversion(completedOnly: !manual) else {
             if !manual { silentLog("emptybuf", "авто молчит: на границе слова буфер пуст") }
-            // Нечего конвертировать (буфер пуст), но нажат хоткей — просто переключаем язык RU↔EN.
+            // Нечего конвертировать (буфер пуст), но нажат хоткей — крутим тот же цикл раскладок,
+            // что у 🌐. Слово или допустимое выделение по-прежнему идут обычным RU↔EN-путём выше.
             // ⚠️ Выделение было, но мы от него отказались (многострочное / вероятная авто-копия).
             // Тогда НИЧЕГО не делаем: смена раскладки со звуком в этот момент — то самое
             // «звук был, а текст не изменился», по которому люди и решают, что программа сломана.
@@ -1420,16 +1781,20 @@ final class Engine: EventTapHandler {
                 return
             }
             if manual {
-                let toCyr = !layout.currentIsCyrillic()
-                layout.selectLayout(cyrillic: toCyr)
+                let cycled = layout.cycleLayout()
                 onLayoutMaybeChanged?()
-                playSound()
+                // ⚠️ ЗВУКА ЗДЕСЬ БОЛЬШЕ НЕТ (отзыв @alpus, 07.09.2026: «звучок смены есть, но
+                // реакции никакой»). Раскладку мы правда переключили, но звук у нас ОДИН и тот же
+                // на конверсию и на цикл, поэтому он обещает изменившийся текст — а текста никто не
+                // трогал. Тот же цикл по 🌐 молчит с 24.07, и принцип «лучше ничего, чем звук
+                // впустую» уже записан этажом выше для отклонённого выделения. О смене раскладки
+                // человеку говорит значок в строке меню, как и на 🌐.
                 // ⚠️ Эта ветка ЗВУЧИТ и МЕНЯЕТ РАСКЛАДКУ, но до 28.07 не писала в лог ни строки.
                 // автор дважды сообщал «во время начала диктовки играет звук конверсии», а
                 // воспроизвести не удаётся — при этом единственный путь, где звук звучит без
                 // всякой конверсии, ровно этот. Пишем, кто и когда его дёрнул: если он сработает
                 // на старте диктовки, в логе это будет видно рядом с `voice:` (задача #47).
-                kbLog("хоткей при пустом буфере: конвертировать нечего, просто сменил язык → \(toCyr ? "RU" : "EN")")
+                kbLog("хоткей при пустом буфере: конвертировать нечего, \(cycled ? "переключил раскладку циклом" : "циклить нечего")")
             }
             return
         }
@@ -1476,15 +1841,46 @@ final class Engine: EventTapHandler {
             silentLog("resonance", "авто молчит: анти-резонанс заморозил конверсию (len \(word.count))")
             liveFixLast = ""; buffer.clear(); return
         }
+
+        // ДВОЙНОЙ ПРОБЕЛ → ТОЧКА (задача #190). Если main задержал boundary-конверсию, второй
+        // физический пробел уже успел прийти, а macOS могла превратить экранный хвост в `. `.
+        // Раньше мы удаляли этот хвост вместе со словом и ретайпили буферные `  `, стирая системную
+        // точку. Теперь меняем ТОЛЬКО ведущую пару в той же замене: длина остаётся прежней, поэтому
+        // уже поставленная системой точка не дублируется. Ручной хоткей и медленные/сомнительные
+        // пары не затрагиваются; официальный глобальный флаг AppKit читается вне tap-callback.
+        let replacementTail: String
+        let completedTail: String
+        if manual {
+            replacementTail = item.tail
+            completedTail = buffer.lastTail
+        } else {
+            replacementTail = DoubleSpacePeriodRule.rewrittenTail(
+                item.tail,
+                after: converted,
+                systemEnabled: systemDoubleSpacePeriodEnabled,
+                doubleSpaceGap: buffer.lastTailDoubleSpaceGap,
+                maximumGap: Self.doubleSpacePeriodMaximumGap
+            )
+            completedTail = DoubleSpacePeriodRule.rewrittenTail(
+                buffer.lastTail,
+                after: converted,
+                systemEnabled: systemDoubleSpacePeriodEnabled,
+                doubleSpaceGap: buffer.lastTailDoubleSpaceGap,
+                maximumGap: Self.doubleSpacePeriodMaximumGap
+            )
+        }
+        let preservedDoubleSpacePeriod = replacementTail != item.tail
         // ФАНТОМНЫЙ ПРЕДОХРАНИТЕЛЬ (24.07): экран уже показывает итог? Тогда буфер отстал от
         // жизни (стейл-переводы) — заменять нечего, только звук и мигание. Молча выравниваем
         // модель по экрану. AX молчит (Electron/веб) → nil → обычный путь.
         // ТОЛЬКО в окне после НАШЕГО переключения раскладки: стейл-фантом возможен лишь там, а AX-чтение
         // синхронно на main (до ~150мс IPC) — гонять его на КАЖДУЮ конверсию congestило main и роняло
         // тап по таймауту у занятых приложений (репорт #8, 0.2.66). Вне окна буфер достоверен, страж не нужен.
-        if !manual, layout.withinOwnSelectGrace, AXScreenCheck.caretEndsWith(converted + item.tail) == true {
+        if !manual, layout.withinOwnSelectGrace,
+           AXScreenCheck.caretEndsWith(converted + replacementTail) == true {
             kbLog("фантом предотвращён: на экране уже итог (AX), len \(converted.count) — буфер выровнен")
-            buffer.applyConversion(converted: converted)
+            buffer.applyCompletedConversion(converted: converted)
+            if preservedDoubleSpacePeriod { buffer.applyCompletedTail(completedTail) }
             return
         }
 
@@ -1492,12 +1888,19 @@ final class Engine: EventTapHandler {
         kbLog("\(autoProp?.rescue == true ? "mixed-rescue" : "convert-word")\(manual ? "(хоткей)" : "(авто)"): \(item.deleteCount) симв. \(Self.scriptClass(word)) → \(toCyrillic ? "RU" : "EN")")   // без контента
         noteConvRepeat(word: word, produced: converted, path: manual ? "хоткей" : "boundary")
         // Снятие muted — в completion (после async-постинга), а не фикс-таймером (см. live-fix выше).
-        TextReplacer.replace(deleteCount: item.deleteCount, with: converted + item.tail) { [weak self] in
+        TextReplacer.replace(deleteCount: item.deleteCount, with: converted + replacementTail) { [weak self] in
             guard let self else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + self.muteDrain) { self.endSyntheticFlight() }
         }
+        let tailT0 = CACurrentMediaTime()
         if manual { buffer.applyConversion(converted: converted) }
-        else { buffer.applyCompletedConversion(converted: converted) }   // огрызок следующего слова не трогаем (C2)
+        else {
+            buffer.applyCompletedConversion(converted: converted)       // огрызок следующего слова не трогаем (C2)
+            if preservedDoubleSpacePeriod {
+                buffer.applyCompletedTail(completedTail)
+                kbLog("двойной пробел: системная точка сохранена при boundary-конверсии")
+            }
+        }
         // Обучение на отмене: авто-конверсия → кандидат на откат; ручной ре-флип, отменяющий нашу
         // недавнюю авто-конверсию (U1), — засчитываем как откат.
         if manual {
@@ -1510,16 +1913,47 @@ final class Engine: EventTapHandler {
             // mixed-rescue не учим на отмене (артефакт нашего же флипа, не выбор юзера) — как и раньше.
             UndoLearner.shared.noteConversion(original: word, converted: converted)
         }
+        let modelDone = CACurrentMediaTime()
         settings.rescuedCount += 1                      // зверёк расколдовал ещё одно слово
+        let statsDone = CACurrentMediaTime()
         layout.selectLayout(cyrillic: toCyrillic)
+        let layoutDone = CACurrentMediaTime()
         onLayoutMaybeChanged?()
+        let callbackDone = CACurrentMediaTime()
         playSound()
+        let soundDone = CACurrentMediaTime()
+        let tailSpans = ConversionTailSpans(
+            modelMs: (modelDone - tailT0) * 1_000,
+            statsMs: (statsDone - modelDone) * 1_000,
+            layoutMs: (layoutDone - statsDone) * 1_000,
+            callbackMs: (callbackDone - layoutDone) * 1_000,
+            soundMs: (soundDone - callbackDone) * 1_000,
+            totalMs: (soundDone - tailT0) * 1_000
+        )
+        if tailSpans.isSlow { kbLog(tailSpans.logLine(manual: manual)) }
         // muted снимается в completion TextReplacer выше (после постинга синтетики).
     }
 
     /// Слова, которые ВЫГЛЯДЯТ как опечатка «две заглавные», но ею не являются. См. fixTwoLeadingCaps.
     private static let twoCapsKeep: Set<String> = [
         "iphone", "ipad", "ipod", "imac", "icloud", "itunes", "imessage", "ibooks", "iwork", "ebay",
+    ]
+
+    /// Имена, которые пишутся со строчной первой буквы НАМЕРЕННО, в их каноническом написании.
+    ///
+    /// ⚠️ ЗДЕСЬ НЕ СТОП-СПИСОК, А СЛОВАРЬ ПРАВИЛЬНОГО НАПИСАНИЯ, и это разные вещи (поймал автор
+    /// 20.08.2026, вопрос «а почему мы теперь не трогаем mACOS?»). Первая версия правки по отзыву
+    /// #156 сравнивала слово в НИЖНЕМ регистре, поэтому защищала заодно и поломку: «mACOS» это как
+    /// раз слово, набранное с прилипшим Caps Lock, и оставлять его как есть неправильно.
+    ///
+    /// Правильное поведение: «iOS» не трогаем вовсе (оно уже каноническое), а «mACOS» приводим к
+    /// «macOS» — то есть к тому, что человек и хотел написать. Прежняя правка дала бы «Macos», что
+    /// не лучше поломки.
+    static let brandSpelling: [String: String] = [
+        "ios": "iOS", "ipados": "iPadOS", "macos": "macOS", "watchos": "watchOS",
+        "tvos": "tvOS", "visionos": "visionOS", "iphone": "iPhone", "ipad": "iPad",
+        "imac": "iMac", "icloud": "iCloud", "itunes": "iTunes", "imessage": "iMessage",
+        "ebay": "eBay", "esim": "eSIM", "iot": "IoT",
     ]
 
     /// ДВЕ ЗАГЛАВНЫЕ ПОДРЯД в начале слова: «КОгда» → «Когда» (задача T28, просьба #14).
@@ -1583,20 +2017,73 @@ final class Engine: EventTapHandler {
     private func fixCapsLockWord(word: String, item: (word: String, tail: String, deleteCount: Int)) -> Bool {
         guard settings.typoFix else { return false }
         let ch = Array(word)
-        guard ch.count >= 3, ch.allSatisfy({ $0.isLetter }) else { return false }
+        // ⚠️ ОТ ПЯТИ БУКВ, А НЕ ОТ ТРЁХ (отзыв #156, 20.08.2026). Условие «первая строчная, остальные
+        // заглавные» задумывалось под «пРИВЕТ», но ровно под него же попадает «iOS»: i строчная, O и
+        // S заглавные, три буквы, одна письменность. Человек писал «iOS», получал «Ios» и не понимал,
+        // при чём тут выключенная у него настройка про две заглавные (это соседнее правило, а живёт
+        // оно в общей настройке исправления опечаток).
+        //
+        // Порог выбран так: слово, набранное с прилипшим Caps Lock, почти всегда длиннее — это
+        // обычное слово языка, а не аббревиатура. А вот коротких имён вида «iOS», «eBay», «iOS 26»
+        // в латинице полно, и все они выглядят для правила одинаково.
+        guard ch.count >= 5, ch.allSatisfy({ $0.isLetter }) else { return false }
         guard ch[0].isLowercase, ch.dropFirst().allSatisfy({ $0.isUppercase }) else { return false }
         guard word.hasCyrillic != word.hasLatinLetter else { return false }
         guard !ExceptionStore.shared.ignored.contains(word.lowercased()) else { return false }
-        let fixed = String(ch[0]).uppercased() + String(ch.dropFirst()).lowercased()
-        guard fixed != word else { return false }
+        // Известное имя: приводим к КАНОНИЧЕСКОМУ написанию, а не к «первая заглавная, остальные
+        // строчные». Если человек уже написал канонически — не трогаем вовсе (guard ниже отсеет
+        // совпадение), а если сломал Caps Lock'ом — чиним туда, куда он и целился.
+        let canonical = Self.brandSpelling[word.lowercased()]
+        let fixed = canonical ?? (String(ch[0]).uppercased() + String(ch.dropFirst()).lowercased())
+        guard fixed != word else { return false }   // уже написано правильно — молчим
         muted = true
         kbLog("caps lock: \(item.deleteCount) симв. развёрнуто")   // без контента (принцип №2)
         UndoLearner.shared.noteConversion(original: word, converted: fixed)
+        lastTextFix = (word, fixed)                                           // чтобы хоткей мог вернуть
         TextReplacer.replace(deleteCount: item.deleteCount, with: fixed + item.tail) { [weak self] in
             guard let self else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + self.muteDrain) { self.endSyntheticFlight() }
         }
         buffer.applyCompletedConversion(converted: fixed)
+        return true
+    }
+
+    /// ПОСЛЕДНЯЯ ПРАВКА ТЕКСТА (не раскладки): что было и что стало.
+    ///
+    /// ⚠️ Нужна для отмены хоткеем ручного переключения (просьба автора 20.08, повод — отзыв #156:
+    /// человек набрал «iOS», мы сделали «Ios», он нажал привычное сочетание «верни как было» и
+    /// получил «Шщы», то есть конверсию раскладки поверх нашей же ошибки).
+    ///
+    /// ⚠️ ЖИВЁТ ДО ГРАНИЦЫ СЛОВА, а не по таймеру. Пока человек не ушёл с этого слова, отмена
+    /// осмысленна; ушёл — сочетание снова означает «переключи раскладку», как и раньше. Таймер тут
+    /// был бы хуже: он делает поведение непредсказуемым ровно в тот момент, когда человек торопится.
+    private var lastTextFix: (original: String, fixed: String)?
+
+    /// Вернуть слово, которое мы только что «исправили». true — отмена случилась.
+    ///
+    /// ⚠️ СРАВНИВАЕМ С ТЕМ, ЧТО СЕЙЧАС В БУФЕРЕ. Если человек успел дописать или стереть, наша
+    /// память устарела и отменять нечего: молча уходим в обычную конверсию, а не портим текст
+    /// второй раз.
+    ///
+    /// ⚠️ ОТМЕНУ ЗАПОМИНАЕТ `UndoLearner`. Это тот же сигнал, что и ручной откат: слово получает
+    /// защиту на сессию, и мы перестаём трогать его снова и снова. Иначе человек отменял бы одну и
+    /// ту же правку до конца дня.
+    private func undoLastTextFix() -> Bool {
+        guard let fix = lastTextFix, let item = buffer.wordForConversion() else { return false }
+        guard item.word == fix.fixed else { lastTextFix = nil; return false }
+        muted = true
+        kbLog("отмена правки: \(item.deleteCount) симв. возвращено")   // без контента (принцип №2)
+        _ = UndoLearner.shared.noteManualConvert(from: fix.fixed, to: fix.original)
+        // Даже если 4-секундное окно обучения уже истекло, это всё равно явный выбор пользователя:
+        // не даём автоисправлению немедленно превратить возвращённое слово обратно.
+        UndoLearner.shared.protect(fix.original)
+        lastTextFix = nil
+        TextReplacer.replace(deleteCount: item.deleteCount, with: fix.original + item.tail) { [weak self] in
+            guard let self else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.muteDrain) { self.endSyntheticFlight() }
+        }
+        buffer.applyCompletedConversion(converted: fix.original)
+        playSound()
         return true
     }
 
@@ -1607,6 +2094,7 @@ final class Engine: EventTapHandler {
         muted = true
         kbLog("опечатка: \(item.deleteCount) симв. исправлено")   // без контента (принцип №2)
         UndoLearner.shared.noteConversion(original: word, converted: fixed)   // откат научит нас навсегда
+        lastTextFix = (word, fixed)                                           // чтобы хоткей мог вернуть
         TextReplacer.replace(deleteCount: item.deleteCount, with: fixed + item.tail) { [weak self] in
             guard let self else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + self.muteDrain) { self.endSyntheticFlight() }
@@ -1648,53 +2136,73 @@ final class Engine: EventTapHandler {
         // предыдущее слово разрешает короткие коллизии (yt↔не) и классификаторы (vitamin d). O(1).
         // Для завершённого слова (boundary) «предыдущее» — это dropLast: само слово уже лежит
         // последним в sessionWords, и forCurrent:true вернуло бы его самого как контекст (C2).
-        let prevW = buffer.contextWord(forCurrent: !completed && !buffer.currentWord.isEmpty)
+        let contextForCurrent = !completed && !buffer.currentWord.isEmpty
+        let prevW = buffer.contextWord(forCurrent: contextForCurrent)
+        let earlierW = buffer.earlierContextWord(forCurrent: contextForCurrent)
         // Флаг ОДНОРАЗОВЫЙ: снимаем его прямо здесь, при первом же решении после прыжка каретки.
         // Дальше он не нужен и был бы вреден — человек кликает постоянно, и застрявший флаг молча
         // отключил бы починку одиночных предлогов в начале следующей фразы.
-        let afterJump = caretJumpedSinceClear
+        var afterJump = caretJumpedSinceClear
         caretJumpedSinceClear = false
+        // ⚠️ ЗДЕСЬ МЫ ПЕРЕСТАЁМ ГАДАТЬ И НАЧИНАЕМ СМОТРЕТЬ (задача 187, наблюдение автора 22.08.2026).
+        // Правило «после прыжка каретки одиночную букву не трогаем» защищает букву, вписанную ВНУТРЬ
+        // уже написанного слова. Но оно слепое: в пустом поле оно молчит ровно так же, хотя чинить
+        // там безопасно, и человек видит «первый раз не сработало, второй сработал».
+        // Ответ пробы получен заранее, на самом клике, поэтому здесь это чтение поля, а не запрос.
+        if afterJump, word.count == 1 {
+            switch caretLeftAtJump {
+            case .boundary:
+                afterJump = false
+                kbLog("одиночная буква после клика: слева пусто (Accessibility) — правило прыжка снято")
+            case .letter:
+                break   // слева стои́т слово — это тот самый опасный случай, молчим
+            case .unknown:
+                // Accessibility слеп (Electron, web). Судим по Backspace: правка буквы ВНУТРИ слова
+                // без стирания неверной невозможна, а начало фразы с одиночной буквы — наоборот.
+                if !backspaceSinceJump {
+                    afterJump = false
+                    kbLog("одиночная буква после клика: стираний не было — считаю началом ввода")
+                }
+            }
+        }
         switch LayoutDetector.decide(word: word, exceptions: ExceptionStore.shared, prev: prevW,
-                                     afterCaretJump: afterJump) {
+                                     earlier: earlierW, afterCaretJump: afterJump) {
         case .keep:
             silentLog("keep", "авто молчит: детектор keep (len \(word.count), \(Self.scriptClass(word)), раскладка(мнение)=\(layout.currentIsCyrillicOpinion() ? "RU" : "EN"))")
             return nil
         case .convert(let c):
-            // Мягкий фильтр: не трогаем одиночные и повторяющиеся буквы — только очевидные
-            // слова (анти-Punto: C/V/B + пробел не должны конвертиться).
-            // Включается (а) для программ-исключений в режиме «Мягкий», (б) ГЛОБАЛЬНО при
-            // режиме разработчика: переменные c/d/i и команды живут не только в IDE —
-            // в Slack, заметках, доках (просьба автора 2026-06-09).
+            // МЯГКИЙ ФИЛЬТР — два правила, и оба про «только очевидные слова».
             //
-            // ⚠️ ПОРОГ ОПУЩЕН С ДВУХ БУКВ ДО ОДНОЙ (автор 07.08.2026, по отзыву @ToshaSoft:
-            // «Figma d HA», «spotlight yt может», «telegram b whatsapp»). Риск у одно- и
-            // двухбуквенных РАЗНЫЙ, а фильтр бил по обоим одинаково. Июньский довод назван
-            // дословно: «переменные c/d/i» — это ОДИНОЧНЫЕ буквы, и они остаются под защитой.
-            // А двухбуквенные идентификаторы редки, тогда как «не», «то», «за», «из», «ли»,
-            // «ни» это самые частые слова языка, и глушить их везде оказалось дороже.
+            // 1. Короткое (≤2 букв) или из одной повторяющейся буквы не трогаем никогда.
+            // 2. Слово с длинной паузой внутри не трогаем: это был не набор, а команды.
             //
-            // Почему это безопаснее, чем кажется: выше по каскаду стоит strict-gate, который
-            // держит ЛЮБОЕ слово, валидное в языке набора. Двухбуквенные английские слова
-            // (id, ok, is, to) он не отдаст и без этого фильтра.
+            // Полная история обоих правил и цена размена — у `softMaxIntraWordGap`.
+            //
             // ⚠️ ТОЛЬКО МЯГКИЙ РЕЖИМ, БЕЗ ГЛОБАЛЬНОГО РЕЖИМА РАЗРАБОТЧИКА (решение автора 11.08.2026).
-            //
             // Раньше здесь стояло `soft || developerMode`, и вторая половина глушила короткие слова
             // ВЕЗДЕ, включая мессенджеры и заметки. Отзыв @ToshaSoft #120 показал цену: «keyboop b
             // someone», «z очень люблю», «j качестве» — предлоги не чинились нигде, потому что
-            // человек однажды включил режим разработчика ради кода.
+            // человек однажды включил режим разработчика ради кода. Расстановка ролей осталась той
+            // же: осторожность живёт в исключениях, а в переписке «c» и «d» это предлоги, а не
+            // переменные. Режим разработчика никуда не делся — он выключает авто в IDE целиком.
             //
-            // Новая расстановка ролей, и она честнее: опасные программы (редакторы кода, IDE)
-            // сидят в исключениях с мягким режимом, и вот ТАМ работает именной список. Везде
-            // остальном защиты нет вовсе, потому что и опасности нет: «c» и «d» в переписке это
-            // предлоги, а не переменные. Режим разработчика при этом никуда не делся, он по-прежнему
-            // выключает авто в IDE и терминалах целиком.
+            // Почему это безопаснее, чем кажется: выше по каскаду стоит strict-gate, который держит
+            // ЛЮБОЕ слово, валидное в языке набора. Английские id/ok/is/to он не отдаст и без нас.
             if soft {
                 let core = Keymap.core(of: word).lowercased()
-                let pass = Self.softShortPass.contains(core)
-                if !pass, core.count <= 2 || Set(core).count == 1 {
-                    silentLog("soft", "авто молчит: мягкий фильтр (короткое/однобуквенное, len \(word.count))")
+                if core.count <= 2 || Set(core).count == 1 {
+                    silentLog("soft-short", "авто молчит: мягкий фильтр (короткое, len \(word.count)) · \(frontAppBID)")
                     return nil
                 }
+                // Ритм: слово набирают слитно, команды разделены взглядом на экран. Слово, внутри
+                // которого была пауза длиннее порога, в опасной программе не трогаем.
+                let gap = completed ? buffer.lastWordGap
+                                    : (buffer.currentWord.isEmpty ? buffer.lastWordGap : buffer.currentWordGap)
+                if gap > Self.softMaxIntraWordGap {
+                    silentLog("soft-gap", "авто молчит: мягкий фильтр (пауза внутри слова \(Int(gap * 1000))мс, len \(word.count)) · \(frontAppBID)")
+                    return nil
+                }
+                silentLog("soft-pass", "мягкий режим пропускает: len \(word.count), пауза \(Int(gap * 1000))мс · \(frontAppBID)")
             }
             let converted = Keymap.smartConvert(word, toCyrillic: c, isValidTarget: Self.ruWordValidator)
             if converted == word {
@@ -1705,50 +2213,44 @@ final class Engine: EventTapHandler {
         }
     }
 
-    /// ⚠️ ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ ИЗ МЯГКОГО ФИЛЬТРА (автор 07.08.2026, отзыв @ToshaSoft).
+/// ПОРОГ РИТМА ДЛЯ МЯГКОГО РЕЖИМА: пауза внутри слова, после которой мы считаем, что это были
+    /// не буквы, а команды. Секунда с запасом: внутри слова человек столько не молчит, а между
+    /// двумя горячими клавишами монтажа проходит и больше.
     ///
-    /// Мягкий фильтр глушит всё короче трёх букв, и это правильно: в коде `c`, `d`, `dx`, `gc`
-    /// это переменные, а не слова. Но он же глушил «не», «по», «до», «от», то есть самые частые
-    /// слова языка, и человек, пишущий «telegram и whatsapp» в мессенджере с включённым
-    /// dev-режимом, оставался с латинской кашей.
+    /// ⚠️ ЗДЕСЬ БЫЛ ИМЕННОЙ СПИСОК КОРОТКИХ СЛОВ, И ЕГО УБРАЛИ 23.08.2026 (наблюдение автора).
+    /// Он пускал в мягком режиме 18 коротких слов: одиночные f/b/j/z/r (а/и/о/я/к) и двухбуквенные
+    /// предлоги yt/gj/lj/jn/yf/yj/lf/bp/pf/yb/nj/cj/rj. Заведён он был 07–11.08 по отзыву #120,
+    /// ради предлогов в прозе внутри редакторов кода, и там работал.
     ///
-    /// Порог просто опустить до одной буквы НЕЛЬЗЯ, я это замерил: тогда сквозь фильтр проходят
-    /// 60 двухбуквенных токенов, среди них `fn`→«ат» (ключевое слово Rust), `dx`→«вч», `gc`→«пс»,
-    /// `cn`→«ст». В редакторе кода это ровно те ложные срабатывания, ради которых мягкий режим и
-    /// заведён. Поэтому не порог, а ИМЕННОЙ СПИСОК: только служебные слова из первой полусотни по
-    /// частоте, и ничего похожего на идентификатор.
+    /// Цена вскрылась в Adobe Premiere. Горячие клавиши там ГОЛЫЕ (C, V, N, Y, T, J, K, L), а
+    /// пробел это воспроизведение, то есть для нас граница слова. Две команды подряд плюс пробел
+    /// это ровно «lj» → «до», «yf» → «на», «nj» → «то»: слово из списка, законная конверсия, звук,
+    /// два Backspace и печать русских букв прямо в таймлайн. В логе 23.08 это видно построчно
+    /// (17:22:16, «convert-word(авто): 2 симв. LAT → RU»).
     ///
-    /// Чего здесь сознательно НЕТ: `vs` (versus), `dj` (диджей), `kb` (килобайт) — живые
-    /// английские сокращения, их латинская форма человеком и задумана.
-    /// ⚠️ ОДНОБУКВЕННЫЕ ДОБАВЛЕНЫ 11.08.2026 (решение автора, отзыв @ToshaSoft #120), и список
-    /// именно ИМЕННОЙ по той же причине, что и у двухбуквенных: порог пускать нельзя.
-    ///
-    /// Что пускаем: f→а, b→и, j→о, z→я, r→к. Что осознанно НЕ пускаем даже в мягком режиме:
-    ///   • `c` и `d` — те самые «переменные c/d», ради которых мягкий режим и заведён;
-    ///   • `e` — самый частый идентификатор в JS (`catch (e)`, `onClick(e)`);
-    ///   • `i` — счётчик цикла (и «ш» русским словом всё равно не является, так что он и не дошёл бы).
-    /// Из пяти случаев в отзыве это чинит четыре. Пятый («e меня») остаётся ценой за `catch (e)`,
-    /// и в обычных программах он всё равно чинится: мягкий режим живёт только в редакторах кода.
-    private static let softShortPass: Set<String> = [
-        "f",   // а
-        "b",   // и
-        "j",   // о
-        "z",   // я
-        "r",   // к
-        "yt",  // не
-        "gj",  // по
-        "lj",  // до
-        "jn",  // от
-        "yf",  // на
-        "yj",  // но
-        "lf",  // да
-        "bp",  // из
-        "pf",  // за
-        "yb",  // ни
-        "nj",  // то
-        "cj",  // со
-        "rj",  // ко
-    ]
+    /// Отличить команду от буквы по СОСТАВУ нельзя: «yf» одновременно предлог «на» и две законные
+    /// команды. Отличается ритм, поэтому теперь смотрим на него, а короткие слова в опасных
+    /// программах не трогаем вовсе. Плата: в редакторах кода предлоги из #120 больше не чинятся
+    /// сами (ручное переключение работает как работало). Это осознанный размен в сторону «лучше не
+    /// исправить, чем исправить правильное».
+    private static let softMaxIntraWordGap: TimeInterval = 1.0
+
+    /// Общая атомарная доставка точной опечатки перед Enter. Реальный Enter уже проглочен:
+    /// сначала заменяем слово, затем тем же synth-заданием отдаём Return приложению.
+    private func applyTypoBeforeReturn(word: String, fixed: String, kind: String) -> Bool {
+        muted = true
+        kbLog("\(kind)(enter-pre): \(word.count) симв. исправлено")   // без контента
+        // После отправки отменять уже нечего. Убираем и старую пару, иначе запоздалая boundary-правка
+        // может совпасть с новым буфером и вернуть исходник в уже очищенное поле чата.
+        lastTextFix = nil
+        TextReplacer.replace(deleteCount: word.count, with: fixed, thenReturn: true) { [weak self] in
+            guard let self else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.muteDrain) { self.endSyntheticFlight() }
+        }
+        buffer.applyConversion(converted: fixed)
+        buffer.boundary("\n")
+        return true
+    }
 
     /// Enter-гонка «send on Enter» (репорт Жени 11.07, скрин: «nbgf» отправлен, «типа» осталось в
     /// строке ввода): чат отправляет сообщение по Enter МГНОВЕННО, а boundary-конверсия приходила
@@ -1761,7 +2263,7 @@ final class Engine: EventTapHandler {
     /// Возвращает true, если Enter проглочен (уйдёт синтетикой).
     private func convertBeforeReturn(flags: CGEventFlags) -> Bool {
         guard Warm.isReady else { return false }   // см. Warm
-        guard settings.enterPreConvert, settings.autoEnabled, settings.triggerEnter, !muted else { return false }
+        guard settings.enterPreConvert, settings.autoEnabled, settings.triggerEnter, !muted, !Pause.active else { return false }
         // Только «голый» Enter: ⇧/⌘/⌥/⌃+Enter несут свою семантику (newline/alt-send) — не задерживаем,
         // а синтетический Return всё равно ушёл бы без модификаторов (postKey шлёт flags=[]).
         guard flags.intersection([.maskShift, .maskCommand, .maskAlternate, .maskControl]).isEmpty else { return false }
@@ -1784,7 +2286,25 @@ final class Engine: EventTapHandler {
         if settings.developerMode && frontAppIsDev { return false }
         let appMode = frontAppMode
         if appMode == "off" { return false }
-        guard let prop = autoConversionProposal(word: word, soft: appMode == "soft") else { return false }
+
+        // ЧИСЛОВАЯ ОПЕЧАТКА ДО ENTER (отзыв #218): `1ю8` → `1.8`.
+        //
+        // Обычная правка опечаток живёт на границе слова, но в чатах реальный Enter мгновенно
+        // отправляет и очищает поле. Если ждать async-boundary, замена прилетит уже в пустую строку.
+        // Поэтому этот детерминированный случай глотаем и выпускаем синтетический Return строго
+        // после замены — тем же безопасным путём, что конверсия раскладки ниже. Раскладку, счётчик
+        // «расколдовано» и звук не трогаем: это правка текста внутри общего typoFix.
+        if let fixed = TypoFix.shared.numericSuggestion(word) {
+            return applyTypoBeforeReturn(word: word, fixed: fixed, kind: "числовая опечатка")
+        }
+        let prop = autoConversionProposal(word: word, soft: appMode == "soft")
+        // Обычный механический поиск остаётся на async-boundary. Здесь после отказа раскладки
+        // разрешаем только O(1)-правку из курируемой таблицы: это закрывает Telegram-send, не
+        // добавляя перебор словаря в самый горячий callback проекта.
+        if prop == nil, let fixed = TypoFix.shared.curatedSuggestion(word) {
+            return applyTypoBeforeReturn(word: word, fixed: fixed, kind: "курируемая опечатка")
+        }
+        guard let prop else { return false }
         // AX-предохранителя здесь НЕТ намеренно (финал аудита 24.07, R1): enter-pre работает
         // СИНХРОННО внутри колбэка тапа, а AX-чтение — до 2×50мс IPC к занятому приложению =
         // риск kCGEventTapDisabledByTimeout на самом горячем пути «Enter-отправить». Boundary и

@@ -309,9 +309,9 @@ enum HotkeyGuard {
     /// интерфейсе, а не в момент нажатия.** Арбитраж на горячем пути был бы и медленнее, и
     /// необъяснимее для человека: «нажал, сработало не то» без единой подсказки почему.
     ///
-    /// Добавляя СЕДЬМОЙ хоткей, добавь его сюда же. Это единственное место, где перечислены все.
+    /// Добавляя СЛЕДУЮЩИЙ хоткей, добавь его сюда же. Это единственное место, где перечислены все.
     enum Slot: CaseIterable {
-        case convert, voice, translate, instant, snippet, plainPaste, caseChange
+        case convert, voice, translate, instant, snippet, plainPaste, caseChange, pasteDictation
 
         /// Как назвать функцию человеку в тексте «занято: %@».
         var name: String {
@@ -323,6 +323,23 @@ enum HotkeyGuard {
             case .snippet:    return L10n.t("is.busy.snippet")
             case .plainPaste: return L10n.t("is.busy.paste")
             case .caseChange: return L10n.t("is.busy.case")
+            case .pasteDictation: return L10n.t("is.busy.pasteLast")
+            }
+        }
+
+        /// Раздел настроек, где эту комбинацию меняют.
+        ///
+        /// ⚠️ Появился 07.09.2026 вместе с восьмым слотом. До него плашка «Одна клавиша на два
+        /// действия» открывала ВСЕГДА раздел переключения (`AppDelegate.warnHotkeyClashOnce`), и это
+        /// было верно ровно для двух слотов из семи: сниппеты, вставку без форматирования и смену
+        /// регистра настраивают в «Автозамене», диктовку и вставку последней диктовки — в «Голосе».
+        /// То есть человек по кнопке из предупреждения попадал не туда, где чинить.
+        var settingsSection: SettingsSection {
+            switch self {
+            case .convert, .instant:                  return .switching
+            case .voice, .pasteDictation:             return .voice
+            case .translate:                          return .translate
+            case .snippet, .plainPaste, .caseChange:  return .snippets
             }
         }
 
@@ -351,20 +368,118 @@ enum HotkeyGuard {
             case .caseChange:
                 guard s.caseChangeEnabled else { return nil }
                 return ("key", s.caseChangeKeyCode, s.caseChangeModifiers)
+            case .pasteDictation:
+                guard s.pasteDictationEnabled else { return nil }
+                return ("key", s.pasteDictationKeyCode, s.pasteDictationModifiers)
             }
         }
     }
 
+    /// Модификатор → его физические клавиши, ОБЕ СТОРОНЫ. Единственная таблица на приложение.
+    ///
+    /// ⚠️ Копий было две — эта и `EventTap.keyCodeMatchesMask` — и они разошлись (отзыв #204).
+    /// Держим одну: расхождение между «как ловим» и «как проверяем конфликт» не видно ни в одном
+    /// тесте, а наружу выходит как «хоткей не работает и никто не предупредил».
+    /// Fn и ⇪ здесь намеренно нет: они бывают только `modkey`, где сравнивается точный keyCode.
+    static let modifierKeys: [(CGEventFlags, [Int])] = [
+        (.maskShift,     [56, 60]),
+        (.maskAlternate, [58, 61]),
+        (.maskCommand,   [55, 54]),
+        (.maskControl,   [59, 62]),
+    ]
+
+    /// Покрывает ли маска эту физическую клавишу-модификатор (левую ИЛИ правую).
+    static func maskCovers(keyCode: Int, mask: CGEventFlags) -> Bool {
+        for (flag, keys) in modifierKeys where mask.contains(flag) && keys.contains(keyCode) { return true }
+        return false
+    }
+
+    /// Одна ли это физическая клавиша для хоткея «клавиша + модификаторы». Все коды сравниваются
+    /// строго, кроме грейва: `` ` ``/`~` на ANSI это keyCode 50, а на ISO под Esc стоит § с кодом
+    /// 10, и человек жмёт «где ожидает тильду». Поэтому 10 и 50 считаем одной клавишей (research
+    /// 01.07), и хоткей на `` ` `` срабатывает на любой клавиатуре.
+    ///
+    /// ⚠️ ТАБЛИЦА ОДНА НА ПРИЛОЖЕНИЕ, КАК И `modifierKeys` (26.09.2026, задача 244). Раньше пара
+    /// {10, 50} жила только в `EventTap.keyMatches`, а `sameTrigger` сравнивала keyCode строго.
+    /// Итог: ⌥§ и ⌥` в рантайме одна клавиша, а для проверки конфликтов две разные, и на неё можно
+    /// было без единого предупреждения повесить две наши функции. Та же болезнь, что в отзыве
+    /// #204, только на обычной клавише вместо модификатора. Исключение одно, мгновенное
+    /// переключение, и оно разобрано у `graveIsOneKey`.
+    ///
+    /// Без `Set` и без ленивой глобальной таблицы намеренно: функцию зовёт перехватчик на КАЖДОЕ
+    /// нажатие, и там стоить она должна пару сравнений, а не выделение памяти.
+    @inline(__always)
+    static func sameKey(_ a: Int, _ b: Int) -> Bool {
+        if a == b { return true }
+        return (a == 10 || a == 50) && (b == 10 || b == 50)
+    }
+
+    /// Считать ли для этой пары слотов грейв 10 и 50 одной клавишей.
+    ///
+    /// ⚠️ МГНОВЕННОЕ ПЕРЕКЛЮЧЕНИЕ ИСКЛЮЧЕНО, ПОТОМУ ЧТО ЕГО РАНТАЙМ СРАВНИВАЕТ СТРОГО (26.09.2026,
+    /// задача 244, ревью). В `EventTap` его ветка стоит первой и ловит ровно сохранённый keyCode,
+    /// без `keyMatches`, а переводить её на `keyMatches` нельзя: на ISO сочетание «мгновенное ⌥§ +
+    /// диктовка ⌥`» сегодня работает, каждая функция на своей клавише, и диктовка у такого человека
+    /// умерла бы после обновления. Значит, в паре с мгновенным 10 и 50 это РАЗНЫЕ клавиши, и
+    /// проверка обязана думать так же: иначе она показала бы плашку «одна клавиша на два действия»
+    /// там, где работают оба, и не дала бы назначить рабочее сочетание. Для остальных семи слотов
+    /// 10 ≡ 50, как в `keyMatches`: там пара на 10 и 50 значит, что одна функция мертва целиком.
+    static func graveIsOneKey(_ a: Slot, _ b: Slot) -> Bool { a != .instant && b != .instant }
+
     /// Одна и та же ли это комбинация. Сравнение зависит от режима: у голого модификатора значим
     /// только keyCode (маска у левого и правого ⌥ одинакова), у 🌐 сравнивать нечего вовсе.
+    /// `graveAlias` — считать ли грейв 10 и 50 одной клавишей, см. `graveIsOneKey`.
     static func sameTrigger(_ mode: String, _ keyCode: Int, _ mods: UInt64,
-                            as other: (mode: String, keyCode: Int, mods: UInt64)) -> Bool {
-        guard mode == other.mode else { return false }
-        switch mode {
-        case "globe":  return true
-        case "modkey": return keyCode == other.keyCode
-        default:       return keyCode == other.keyCode && mods == other.mods
+                            as other: (mode: String, keyCode: Int, mods: UInt64),
+                            graveAlias: Bool = true) -> Bool {
+        // ⚠️ ДВОЙНОЙ ТАП РАЗБИРАЕМ ДО СРАВНЕНИЯ РЕЖИМОВ (28.08.2026, отзыв #204). Он единственный
+        // жест, который в рантайме НЕ РАЗЛИЧАЕТ СТОРОНЫ: ловится по маске, а keyCode в настройках у
+        // него декоративный (пресет «2× ⌥» хранит 58, но срабатывает и на 61). Из-за `mode ==
+        // other.mode` первой строкой «двойной ⌥» и «правый ⌥» жили в разных вселенных, и назначить
+        // конверсию поверх диктовки не мешал никто — при том что физически это одна клавиша.
+        if mode == "doubletap" || other.mode == "doubletap" {
+            let (dtMods, rest) = mode == "doubletap"
+                ? (mods, other)
+                : (other.mods, (mode: mode, keyCode: keyCode, mods: mods))
+            let mask = CGEventFlags(rawValue: dtMods)
+            switch rest.mode {
+            // Двойной тап против двойного тапа: значима ТОЛЬКО маска.
+            case "doubletap": return mask == CGEventFlags(rawValue: rest.mods)
+            // Двойной тап против голого модификатора: конфликт, если клавиша входит в маску.
+            case "modkey":    return maskCovers(keyCode: rest.keyCode, mask: mask)
+            // `combo` рекордер собирает только из ДВУХ и более модификаторов (см. `count(peak) >= 2`),
+            // а двойной тап требует одиночного (`solo` в EventTap) — пересечься они не могут.
+            // `key` — жест с обычной клавишей, его прикрывает `otherKeyBetweenTaps`. `globe` — Fn.
+            default:          return false
+            }
         }
+        // ⚠️ 🌐 ХРАНИТСЯ В ДВУХ ВИДАХ, И ЭТО ОДНА КЛАВИША (26.09.2026, отзыв #299). Мгновенное
+        // переключение пишет её отдельным режимом ("globe", 63, 0), а пресет ручного переключения
+        // «🌐 Globe / Fn» пишет ту же клавишу обычным голым модификатором ("modkey", 63, Fn).
+        // Пока сравнение начиналось с `mode == other.mode`, эта пара считалась разными
+        // комбинациями. В диагностике #299 ровно она: `конверсия=modkey/63/8388608 · мгновенное=
+        // globe/63/0`. Предупреждения не было ни при назначении, ни при запуске, а в рантайме ветка
+        // мгновенного переключения забирает 🌐 раньше конверсии, и конверсия на ней мертва всегда.
+        // Сводим "globe" к modkey/63 с обеих сторон, как это уже делает `shadows()`. Двойной тап
+        // разобран выше, поэтому его ответ «двойной ⌥ × 🌐 → нет» эта строка не трогает.
+        let a = globeAsModkey((mode, keyCode, mods))
+        let b = globeAsModkey(other)
+        guard a.mode == b.mode else { return false }
+        switch a.mode {
+        case "modkey": return a.keyCode == b.keyCode
+        // Грейв 10 ≡ 50 здесь по той же таблице, что в `EventTap.keyMatches` (задача 244), кроме
+        // пар с мгновенным переключением (`graveIsOneKey`).
+        default:
+            let key = graveAlias ? sameKey(a.keyCode, b.keyCode) : a.keyCode == b.keyCode
+            return key && a.mods == b.mods
+        }
+    }
+
+    /// 🌐 как голый модификатор с кодом 63. Маска у "modkey" в сравнении не участвует, поэтому
+    /// какая она тут, неважно.
+    private static func globeAsModkey(_ t: (mode: String, keyCode: Int, mods: UInt64))
+        -> (mode: String, keyCode: Int, mods: UInt64) {
+        t.mode == "globe" ? ("modkey", 63, CGEventFlags.maskSecondaryFn.rawValue) : t
     }
 
     /// Занята ли комбинация нашей же функцией. `excluding` — слот, который сейчас настраивают:
@@ -383,7 +498,8 @@ enum HotkeyGuard {
     static func ourBusy(mode: String, keyCode: Int, mods: UInt64, excluding: Slot) -> String? {
         for slot in Slot.allCases where slot != excluding {
             guard let t = slot.trigger else { continue }
-            if sameTrigger(mode, keyCode, mods, as: t) { return slot.name }
+            if sameTrigger(mode, keyCode, mods, as: t,
+                           graveAlias: graveIsOneKey(slot, excluding)) { return slot.name }
         }
         return nil
     }
@@ -398,14 +514,15 @@ enum HotkeyGuard {
     ///  • настройки достались от версии, где проверки ещё не было, и просто пережили обновления.
     /// Снаружи это выглядит не как конфликт, а как «переключение тормозит»: одна клавиша на два
     /// действия заставляет ждать, удержание это или нажатие. Именно так жалобу и прислали.
-    static func activeClashes() -> [(String, String)] {
-        var out: [(String, String)] = []
+    static func activeClashes() -> [(Slot, Slot)] {
+        var out: [(Slot, Slot)] = []
         let slots = Slot.allCases
         for (i, a) in slots.enumerated() {
             guard let ta = a.trigger else { continue }
             for b in slots.dropFirst(i + 1) {
                 guard let tb = b.trigger else { continue }
-                if sameTrigger(ta.mode, ta.keyCode, ta.mods, as: tb) { out.append((a.name, b.name)) }
+                if sameTrigger(ta.mode, ta.keyCode, ta.mods, as: tb,
+                               graveAlias: graveIsOneKey(a, b)) { out.append((a, b)) }
             }
         }
         return out
@@ -489,7 +606,14 @@ final class HotkeyControl: NSView {
         ("2× ⌥  (DoubleOption)",       "doubletap", 58, CGEventFlags.maskAlternate.rawValue),
         // 🌐/Fn как хоткей КОНВЕРСИИ (просьба автора 24.07 — «мало ли кому так удобно»). Событие
         // глотаем в EventTap, поэтому системное действие клавиши не сработает параллельно.
-        ("🌐  Globe / Fn",             "modkey",    63, CGEventFlags.maskSecondaryFn.rawValue)
+        ("🌐  Globe / Fn",             "modkey",    63, CGEventFlags.maskSecondaryFn.rawValue),
+        // ⇪ как хоткей КОНВЕРСИИ (отзыв #160 от 21.08.2026 и ещё несколько просьб до него: «капс
+        // практически никогда не нужен, а в Punto на винде так было можно»). Механизм готов и уже
+        // работает для мгновенной смены языка: ремап Caps→LANG1 через hidutil, см. CapsRemap —
+        // проглотить событие тапом нельзя, замок включается НИЖЕ него.
+        // ⚠️ Пока Caps занят конверсией, настоящий капс-замок делается через ⇧+Caps. Это не наша
+        // выдумка, так устроен тот же механизм у мгновенного переключения.
+        ("⇪  Caps Lock",               "modkey",    57, CGEventFlags.maskAlphaShift.rawValue)
     ]
     /// Локализованный лейбл пресета (modkey → L10n; остальные — статический символ+англ.).
     private static func presetLabel(_ p: (String, String, Int, UInt64)) -> String {
@@ -497,6 +621,7 @@ final class HotkeyControl: NSView {
             switch p.2 {
             case 61: return L10n.t("hk.rOpt"); case 58: return L10n.t("hk.lOpt")
             case 54: return L10n.t("hk.rCmd"); case 59: return L10n.t("hk.lCtrl")
+            case 57: return "⇪  Caps Lock"
             default: break
             }
         }
@@ -548,10 +673,27 @@ final class HotkeyControl: NSView {
             if let busy = HotkeyGuard.ourBusy(mode: p.1, keyCode: p.2, mods: p.3, excluding: .convert) {
                 HotkeyGuard.busyAlert(busy); rebuild(); return
             }
+            // ⚠️ КЛАВИША, У КОТОРОЙ ЕСТЬ СВОЁ СИСТЕМНОЕ ДЕЙСТВИЕ, ОТБИРАЕТСЯ ТОЛЬКО С СОГЛАСИЯ.
+            // Caps Lock и 🌐 мы не проглатываем, а забираем у системы насовсем (hidutil-ремап и
+            // AppleFnUsageType), потому что их собственное действие живёт НИЖЕ нашего тапа. Значит
+            // человек теряет привычное поведение клавиши, и узнать об этом он должен ДО, а не после.
+            // Тот же диалог показывает мгновенное переключение с 24.07; здесь его не было.
+            if let shadowed = InstantSwitchControl.shadows(mode: p.1, keyCode: p.2, mods: p.3) {
+                let a = NSAlert()
+                a.messageText = L10n.t("is.warn.title")
+                a.informativeText = String(format: L10n.t("is.warn.body"), shadowed)
+                a.addButton(withTitle: L10n.t("is.warn.ok"))
+                a.addButton(withTitle: L10n.t("common.cancel"))
+                guard a.runModal() == .alertFirstButtonReturn else { rebuild(); return }
+            }
             settings.hotkeyMode = p.1
             settings.hotkeyKeyCode = p.2
             settings.hotkeyModifiers = p.3
             settings.hotkeyKeyLabel = ""
+            // Caps живёт через hidutil-ремап, а не через тап: сменили комбинацию — ремап должен
+            // догнать выбор. Зовём БЕЗУСЛОВНО, потому что уход С Caps так же важен, как приход на него.
+            CapsRemap.reconcile()
+            GlobeKey.reconcile()    // 🌐 тоже: её системное действие живёт ниже тапа, см. GlobeKey.wanted
             rebuild()
         } else if i == pop.numberOfItems - 1 {
             startRecording()          // последняя строка — «Назначить свою…» (есть ВСЕГДА)
@@ -616,6 +758,8 @@ final class HotkeyControl: NSView {
                 guard let s = self?.settings else { return }
                 s.hotkeyMode = "key"; s.hotkeyKeyCode = kc
                 s.hotkeyModifiers = mods.rawValue; s.hotkeyKeyLabel = label
+                CapsRemap.reconcile()   // см. выбор пресета: уход с Caps так же важен, как приход
+                GlobeKey.reconcile()
             }
             // Мягкий конфликт показываем ВМЕСТЕ с кандидатом: кнопка «Назначить» остаётся живой,
             // человек решает сам (автор 06.08).
@@ -655,6 +799,8 @@ final class HotkeyControl: NSView {
                         guard let s = self?.settings else { return }
                         s.hotkeyMode = "combo"          // ⌥⇧ и т.п.
                         s.hotkeyKeyCode = -1; s.hotkeyModifiers = p.rawValue; s.hotkeyKeyLabel = ""
+                        CapsRemap.reconcile()   // см. выбор пресета: уход с Caps так же важен, как приход
+                        GlobeKey.reconcile()
                     }
                     freeze(HotkeyRecorderPanel.parts(mods: p))
                 } else if count(peak) == 1, peakKey >= 0 {
@@ -670,6 +816,8 @@ final class HotkeyControl: NSView {
                         guard let s = self?.settings else { return }
                         s.hotkeyMode = "modkey"
                         s.hotkeyKeyCode = pk; s.hotkeyModifiers = p.rawValue; s.hotkeyKeyLabel = ""
+                        CapsRemap.reconcile()   // см. выбор пресета: уход с Caps так же важен, как приход
+                        GlobeKey.reconcile()
                     }
                     freeze(HotkeyRecorderPanel.parts(mods: p))
                 } else { peak = []; peakKey = -1 }
@@ -1357,7 +1505,11 @@ final class InstantSwitchControl: NSView {
         if mode == "key", keyCode == 49, f.contains(.maskCommand) { return L10n.t("is.shadow.spotlight") }
         if mode == "key", keyCode == 49, f.contains(.maskControl) { return L10n.t("is.shadow.inputSrc") }
         if mode == "modkey", keyCode == 57 { return L10n.t("is.shadow.caps") }
-        if mode == "globe" { return L10n.t("is.shadow.globe") }
+        // ⚠️ 🌐 ПРИХОДИТ СЮДА В ДВУХ ВИДАХ. У мгновенного переключения это отдельный режим "globe",
+        // а в списке ручного переключения та же клавиша записана обычным modkey с кодом 63. Пока эта
+        // строка знала только про первый вид, ручное переключение забирало клавишу молча (отзыв
+        // 21.08.2026), хотя её системное действие при этом отключается точно так же.
+        if mode == "globe" || (mode == "modkey" && keyCode == 63) { return L10n.t("is.shadow.globe") }
         return nil
     }
 
@@ -1625,6 +1777,14 @@ final class ModePicker: NSView {
     // направо в стиле современных переключателей macOS». Перетекание это анимация геометрии, а
     // рисование в `draw` умеет только перерисовать всё разом, в новом положении. Со слоями бегунок
     // едет сам, а нам остаётся задать ему новый кадр.
+    /// Мягкий ореол ПОД капсулой: размывает то, что проезжает под переключателем.
+    ///
+    /// Идея автора 20.08.2026, после того как полосу размытия на весь заголовок он забраковал:
+    /// «давай по контуру нашего переключателя добавим такой блюр, чтобы слегка под ним свечение
+    /// было, когда под него заходят элементы настроек». Полоса на всё окно была слишком грубым
+    /// инструментом: она трогала и полосу прокрутки, и первую строку. Ореол по форме плашки решает
+    /// ту же задачу ровно там, где она есть.
+    private let halo = CALayer()
     private let track = CALayer()
     private let thumb = CALayer()
     private var labels: [CATextLayer] = []
@@ -1643,6 +1803,8 @@ final class ModePicker: NSView {
         self.titles = titles
         super.init(frame: .zero)
         wantsLayer = true
+        layer?.masksToBounds = false          // ореол шире капсулы и обязан выходить за её края
+        layer?.addSublayer(halo)
         layer?.addSublayer(track)
         track.addSublayer(thumb)
         for t in titles {
@@ -1678,22 +1840,69 @@ final class ModePicker: NSView {
     // ⚠️ ЯРКОСТЬ ДОБАВЛЯТЬ НЕЛЬЗЯ, МОЖНО ТОЛЬКО ОТНИМАТЬ (он же, тогда же). Включённая половина
     // держит обычную яркость интерфейса, выключенная приглушена. Обратный приём, подсветить
     // активное, делает из служебного переключателя главный предмет в окне.
-    private func ink(_ alpha: CGFloat) -> CGColor {
-        var c = NSColor.labelColor.withAlphaComponent(alpha).cgColor
+    /// ⚠️ ЦВЕТА СПЛОШНЫЕ, А НЕ ПРОЗРАЧНЫЕ (автор 20.08.2026: «переключатель всё равно остался
+    /// полупрозрачным, неактивный пункт как будто просвечивает; нужно, чтобы прозрачности не было,
+    /// просто был цвет»).
+    ///
+    /// Раньше здесь стоял `labelColor.withAlphaComponent(alpha)`, то есть КРАСКА С ДЫРКОЙ: сквозь
+    /// неё видно всё, что позади. Пока за контролом был ровный фон окна, это выглядело как оттенок
+    /// серого. Как только под титлбаром появилось размытое содержимое, сквозь дорожку и подписи
+    /// полезла картинка, и контрол перестал читаться как предмет.
+    ///
+    /// Тот же вид получается смешиванием: берём подложку и подмешиваем к ней долю `labelColor`.
+    /// Разница яркостей между дорожкой, бегунком и подписями сохраняется до уровня, а прозрачности
+    /// нет вовсе.
+    private func ink(_ alpha: CGFloat, over base: NSColor = .windowBackgroundColor) -> CGColor {
+        var c = base.cgColor
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            c = NSColor.labelColor.withAlphaComponent(alpha).cgColor
+            c = (base.blended(withFraction: alpha, of: .labelColor) ?? base).cgColor
         }
         return c
     }
 
-    /// Same quiet track tint as before, composited onto the window color so content cannot show through.
-    private func opaqueTrackInk() -> CGColor {
-        var c = NSColor.windowBackgroundColor.cgColor
+    /// Сплошной цвет как `NSColor` — нужен, чтобы подмешивать следующий слой поверх предыдущего:
+    /// бегунок лежит на дорожке, подписи лежат на бегунке и на дорожке.
+    private func inkColor(_ alpha: CGFloat, over base: NSColor = .windowBackgroundColor) -> NSColor {
+        var c = base
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            c = (NSColor.windowBackgroundColor.blended(withFraction: 0.07, of: .labelColor)
-                 ?? NSColor.windowBackgroundColor).cgColor
+            c = base.blended(withFraction: alpha, of: .labelColor) ?? base
         }
         return c
+    }
+
+    /// Геометрия и краска ореола. Зовётся из `restyle`, потому что размер контрола меняется вместе
+    /// с подписями (смена языка интерфейса).
+    ///
+    /// ⚠️ РАЗМЫТИЕ, А НЕ ТЕНЬ. Тень рисует своё пятно поверх фона и на светлой теме выглядит грязью.
+    /// `backgroundFilters` не добавляет ничего от себя: под плашкой просто теряет резкость то, что
+    /// там оказалось. Пока под переключателем пусто, ореола не видно вовсе, и это правильно.
+    ///
+    /// ⚠️ Маска РАДИАЛЬНАЯ, поэтому ореол гаснет во все стороны. Вертикальная, как у прежней полосы,
+    /// оставила бы резкие боковые кромки, а у капсулы кромок быть не должно.
+    private func layoutHalo() {
+        let pad: CGFloat = 7
+        let r = bounds.insetBy(dx: -pad, dy: -pad)
+        halo.frame = r
+        halo.cornerRadius = r.height / 2
+        halo.masksToBounds = true
+        if halo.backgroundFilters == nil || halo.backgroundFilters?.isEmpty == true {
+            if let blur = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 5]) {
+                halo.backgroundFilters = [blur]
+            }
+        }
+        // Лёгкий тон тем же цветом, что фон окна: гасит свечение светлых букв, не меняя оттенка.
+        halo.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.45).cgColor
+        let mask = (halo.mask as? CAGradientLayer) ?? CAGradientLayer()
+        mask.type = .radial
+        mask.colors = [NSColor.black.cgColor,
+                       NSColor.black.withAlphaComponent(0.9).cgColor,
+                       NSColor.black.withAlphaComponent(0.45).cgColor,
+                       NSColor.clear.cgColor]
+        mask.locations = [0, 0.55, 0.8, 1]
+        mask.startPoint = CGPoint(x: 0.5, y: 0.5)
+        mask.endPoint = CGPoint(x: 1, y: 1)
+        mask.frame = halo.bounds
+        halo.mask = mask
     }
 
     private func restyle(animated: Bool) {
@@ -1703,16 +1912,19 @@ final class ModePicker: NSView {
             CATransaction.setAnimationDuration(0.22)
             CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
         }
+        layoutHalo()
         track.frame = bounds
         track.cornerRadius = bounds.height / 2
-        track.backgroundColor = opaqueTrackInk()
+        let trackColor = inkColor(0.07)
+        let thumbColor = inkColor(0.13, over: trackColor)
+        track.backgroundColor = trackColor.cgColor
 
         // ⚠️ БЕГУНОК ВО ВСЮ ВЫСОТУ ДОРОЖКИ, БЕЗ ЗАЗОРА (автор 17.08: «выделение по высоте такое же,
         // как основная плашка, сейчас оно меньше и смотрится коряво»). Утопленный бегунок это язык
         // сегментного контрола iOS; в строке заголовка macOS он читался как кнопка внутри кнопки.
         thumb.frame = box(selected)
         thumb.cornerRadius = bounds.height / 2
-        thumb.backgroundColor = ink(0.13)
+        thumb.backgroundColor = thumbColor.cgColor
 
         let scale = window?.backingScaleFactor ?? 2
         for (i, l) in labels.enumerated() {
@@ -1721,7 +1933,9 @@ final class ModePicker: NSView {
             l.contentsScale = scale
             l.frame = NSRect(x: b.minX, y: ((b.height - lineH) / 2).rounded(),
                              width: b.width, height: lineH.rounded(.up))
-            l.foregroundColor = i == selected ? ink(0.85) : ink(hover == i ? 0.55 : 0.35)
+            // Подпись мешаем с ТЕМ, НА ЧЁМ ОНА ЛЕЖИТ: выбранная на бегунке, остальные на дорожке.
+            l.foregroundColor = i == selected ? ink(0.85, over: thumbColor)
+                                              : ink(hover == i ? 0.55 : 0.35, over: trackColor)
         }
         CATransaction.commit()
     }

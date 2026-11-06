@@ -4,6 +4,7 @@
 
 # Сборка и дистрибутивы (пересобираются)
 .build/
+build/
 Keyboop.app/
 Keyboop Personal.app/
 .personal-signing.keychain-db*
@@ -29,8 +30,8 @@ site/**/*.mp4
 site/models/
 
 # Разбор чужих приложений — не наше, в историю не кладём
-Handy Files/
-PuntoS files/
+research/handy-files/
+research/punto-files/
 
 # Мусор системы и инструментов
 .DS_Store
@@ -42,3 +43,7 @@ node_modules/
 .code-review-graph/
 *.rej
 *.orig
+
+# Патчи к чужим библиотекам — ЕДИНСТВЕННОЕ, что мы храним от vendor (см. docs/VENDOR_PATCHES.md).
+# Сама библиотека вендорится скриптами, а вот наши правки к ней восстановить неоткуда.
+!vendor-patches/

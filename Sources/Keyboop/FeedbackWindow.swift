@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import UniformTypeIdentifiers
 
 /// Подпись-плейсхолдер, ПРОЗРАЧНАЯ для мыши.
 ///
@@ -29,6 +30,16 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
     private let sendBtn = NSButton()
     private let tgBtn = NSButton()
     private let mailBtn = NSButton()
+    // Вложение (задача 191, 05.09.2026): кнопка выбора, подпись «имя · размер», крестик, повтор.
+    private let attachBtn = NSButton()
+    private let attachName = NSTextField(labelWithString: "")
+    private let attachRemove = NSButton()
+    private let retryBtn = NSButton()
+    /// Выбранный файл. Тип и размер фиксируем в момент выбора: заявка серверу должна совпасть с тем,
+    /// что потом польётся в него, байт в байт.
+    private var attachment: (url: URL, type: String, size: Int)?
+    /// Второй шаг, который ещё не удался: текст уже в базе, токен живёт 15 минут, файл можно повторить.
+    private var pendingUpload: (token: String, type: String, url: URL)?
     /// Экран формы и экран «отправлено» — меняем целиком, а не подписью у кнопки (см. showDone).
     private var formContent: NSView?
     private let doneText = NSTextField(wrappingLabelWithString: "")
@@ -56,6 +67,7 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         // крошечная высота здесь = диагноз, без переписки и догадок.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.syncTextWidth()   // окно уже разложено — приводим ширину к видимой области
             let f = self.textView.frame, c = self.textView.textContainer?.containerSize ?? .zero
             // ⚠️ Высота контейнера при переносе по ширине равна `.greatestFiniteMagnitude`, а `%.0f`
             // печатает её числом в 309 цифр. Строка распирала лог, который человек присылает нам
@@ -65,6 +77,17 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
                   + "контейнер \(dim(c.width))×\(dim(c.height)), "
                   + "скролл \(dim(self.textScroll.frame.width))×\(dim(self.textScroll.frame.height))")
         }
+    }
+
+    /// Ширина поля ввода = ширина видимой области скролла. Единственное место, где она задаётся.
+    /// Контейнер подтягивается сам (`widthTracksTextView`), поэтому его трогаем только вместе с
+    /// вью, чтобы у переноса не появилось второго источника правды.
+    private func syncTextWidth() {
+        let w = textScroll.contentSize.width
+        guard w > 1, abs(textView.frame.width - w) > 0.5 else { return }
+        textView.frame.size.width = w
+        textView.textContainer?.containerSize =
+            NSSize(width: w - textView.textContainerInset.width * 2, height: CGFloat.greatestFiniteMagnitude)
     }
 
     private func build() {
@@ -116,12 +139,33 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.containerSize = NSSize(
-            width: max(0, textScroll.contentSize.width - textView.textContainerInset.width * 2),
-            height: CGFloat.greatestFiniteMagnitude
-        )
         textView.textContainer?.widthTracksTextView = true
+
+        // ⚠️ ШИРИНУ ПОЛЯ ЗАДАЁМ САМИ, А НЕ ЧЕРЕЗ `autoresizingMask = [.width]` (26.08.2026).
+        //
+        // Здесь была причина жалобы «не видно текст», которая пережила две «починки» (репорты
+        // #12, #20, #25, #26) и вернулась скриншотом автора: строки обрезаны по правому краю,
+        // середина фразы просто отсутствует.
+        //
+        // Разбор по диагностикам, 72 отчёта с геометрией: контейнер НИКОГДА не шире поля, то есть
+        // перенос настроен верно. Но у 23 отчётов из 72 (31%) поле оказывалось вдвое шире своего
+        // окна: «поле 906×148, контейнер 894×∞, скролл 440×150». Текст переносится по 894, видно
+        // 440, остальное за краем.
+        //
+        // Арифметика называет виновника без догадок: сломанные ширины это РОВНО 468 + нормальная
+        // (468+423=891, 468+438=906). Авторесайз ПРИБАВЛЯЕТ дельту роста скролла к жёстко заданной
+        // стартовой ширине, а не заменяет её. Сработает это или нет, зависит от того, успел ли
+        // скролл получить размер до назначения documentView — то есть от порядка проходов Auto
+        // Layout. Отсюда и «у одних работает, у других нет» на одной и той же версии.
+        //
+        // Лечится тем, что у ширины появляется ОДИН хозяин: мы синхронизируем её с видимой областью
+        // при каждом изменении размера. Ни стартовое значение, ни порядок проходов больше не важны.
+        textView.autoresizingMask = []
+        textScroll.contentView.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification,
+                                               object: textScroll.contentView, queue: .main) { [weak self] _ in
+            self?.syncTextWidth()
+        }
 
         textScroll.documentView = textView
         textScroll.hasVerticalScroller = true
@@ -146,6 +190,34 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         let contactWhy = NSTextField(wrappingLabelWithString: L10n.t("fb.contactWhy"))
         contactWhy.font = .systemFont(ofSize: 11)
         contactWhy.textColor = .tertiaryLabelColor
+
+        // Вложение (задача 191): скриншот или короткое видео к отзыву. Файл выбирает сам человек
+        // (ask+show+send: имя и размер видны до отправки), а на сервере он не хранится: уходит
+        // разработчику в Telegram и стирается, о чём подпись под кнопкой говорит прямо.
+        attachBtn.title = L10n.t("fb.attach")
+        attachBtn.bezelStyle = .rounded
+        attachBtn.target = self
+        attachBtn.action = #selector(chooseAttachment)
+        attachName.font = .systemFont(ofSize: 12)
+        attachName.textColor = .secondaryLabelColor
+        attachName.lineBreakMode = .byTruncatingMiddle
+        attachName.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        attachName.isHidden = true
+        attachRemove.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: L10n.t("fb.attachRemove"))
+        attachRemove.isBordered = false
+        attachRemove.imagePosition = .imageOnly
+        attachRemove.contentTintColor = .tertiaryLabelColor
+        attachRemove.toolTip = L10n.t("fb.attachRemove")
+        attachRemove.target = self
+        attachRemove.action = #selector(removeAttachment)
+        attachRemove.isHidden = true
+        let attachRow = NSStackView(views: [attachBtn, attachName, attachRemove])
+        attachRow.orientation = .horizontal
+        attachRow.spacing = 8
+        attachRow.alignment = .centerY
+        let attachHint = NSTextField(wrappingLabelWithString: L10n.t("fb.attachHint"))
+        attachHint.font = .systemFont(ofSize: 11)
+        attachHint.textColor = .tertiaryLabelColor
 
         diagCheck.title = L10n.t("fb.diag")
         diagCheck.state = .on
@@ -186,12 +258,18 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         tgBtn.target = self
         tgBtn.action = #selector(sendViaTelegram)
         tgBtn.toolTip = L10n.t("fb.tgTip")
-        let btnRow = NSStackView(views: [status, NSView(), mailBtn, tgBtn, sendBtn])
+        // Повтор файла: появляется, только когда текст уже принят, а второй шаг не удался.
+        retryBtn.title = L10n.t("fb.fileRetry")
+        retryBtn.bezelStyle = .rounded
+        retryBtn.target = self
+        retryBtn.action = #selector(retryUpload)
+        retryBtn.isHidden = true
+        let btnRow = NSStackView(views: [status, NSView(), mailBtn, retryBtn, tgBtn, sendBtn])
         btnRow.orientation = .horizontal
         btnRow.spacing = 10
 
         // AppKit-канон: вертикальный stack с alignment .leading + width-pin для wrapping-строк.
-        let stack = NSStackView(views: [intro, textScroll, contact, contactWhy, diagRow, hint, btnRow])
+        let stack = NSStackView(views: [intro, textScroll, contact, contactWhy, attachRow, attachHint, diagRow, hint, btnRow])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -207,7 +285,11 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             content.widthAnchor.constraint(equalToConstant: 480),
         ])
-        for v in [intro, textScroll, contact, contactWhy, diagRow, hint, btnRow] {
+        stack.setCustomSpacing(4, after: attachRow)
+        // PERSONAL: вложения выключены (`ReleaseFeatures.feedbackAttachments`) — строку не показываем.
+        attachRow.isHidden = !ReleaseFeatures.feedbackAttachments
+        attachHint.isHidden = !ReleaseFeatures.feedbackAttachments
+        for v in [intro, textScroll, contact, contactWhy, attachRow, attachHint, diagRow, hint, btnRow] {
             (v as NSView).widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         }
         formContent = content
@@ -268,9 +350,10 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         return content
     }
 
-    private func showDone(hasContact: Bool) {
+    private func showDone(hasContact: Bool, withFile: Bool = false) {
         guard let w = window else { return }
         doneText.stringValue = L10n.t(hasContact ? "fb.doneWithContact" : "fb.doneNoContact")
+            + (withFile ? "\n\n" + L10n.t("fb.doneFile") : "")
         let done = makeDoneContent()
         w.contentView = done
         w.setContentSize(done.fittingSize); w.clampToScreen()
@@ -294,6 +377,11 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         // Контакт НЕ чистим: кто написал раз, часто пишет и второй, а перенабирать его каждый раз
         // — ровно тот мелкий труд, из-за которого поле и оставляют пустым.
         mailBtn.isHidden = true
+        retryBtn.isHidden = true
+        pendingUpload = nil
+        attachment = nil
+        attachName.isHidden = true
+        attachRemove.isHidden = true
         sendBtn.isEnabled = true
         w.contentView = form
         w.setContentSize(form.fittingSize); w.clampToScreen()
@@ -339,12 +427,7 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         // ⚠️ НАСТРОЙКИ ХОТКЕЕВ обязательны: без них весь класс «приложение блокирует пробел»
         // (репорты #13/#22/#30) по репорту принципиально неразрешим — мы не знаем, что человек
         // назначил. Это ЗНАЧЕНИЯ настроек, не пользовательский текст: принцип №2 не затронут.
-        let hk = """
-        хоткеи: конверсия=\(s.hotkeyMode)/\(s.hotkeyKeyCode)/\(s.hotkeyModifiers) · \
-        диктовка=\(s.voiceHotkeyMode)/\(s.voiceHotkeyKeyCode)/\(s.voiceHotkeyModifiers) (hold=\(s.voiceHoldMode)) · \
-        перевод=\(s.translateHotkeyKeyCode)/\(s.translateHotkeyModifiers) · \
-        мгновенное=\(s.instantSwitchEnabled ? s.instantSwitchMode : "выкл")/\(s.instantSwitchKeyCode)/\(s.instantSwitchMods)
-        """
+        let hk = hotkeysDiagnosticsLine()
         // Список ВКЛЮЧЁННЫХ раскладок: прямая улика для «переключает только в одну сторону»
         // (баг с поиском латиницы по языковому тегу). Только названия, ничего пользовательского.
         let layouts = LayoutManager.enabledLayoutNamesForDiagnostics().joined(separator: ", ")
@@ -353,9 +436,10 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         macOS \(ProcessInfo.processInfo.operatingSystemVersionString) · \(model) · \(arch)
         состояние: \(health)
         доступы: Accessibility=\(Permissions.isTrusted()) · InputMonitoring=\(Permissions.inputMonitoringGranted()) · движок запущен=\(AppHealth.engineRunning) · secure input сейчас=\(AppHealth.secureInputOn)
+        secure input держатель (ИМЯ НЕНАДЁЖНО, поле застревает на первом за сессию): \(AppHealth.secureInputHolder ?? "—")
         запущено из: \(Permissions.launchLocationForDiagnostics())
         раскладки: \(layouts.isEmpty ? "—" : layouts)
-        движок: \(s.voiceEngine) · parakeet установлен=\(ParakeetEngine.modelInstalled) · whisper-модель=\(s.voiceModel)
+        движок: \(s.voiceEngine) · parakeet установлен=\(ParakeetEngine.modelInstalled) · whisper-модель=\(s.voiceModel) · выгрузка после диктовки=\(s.voiceUnloadAfterDictation)
         микрофон: \(micName)
         авто-переключение=\(s.autoEnabled) · live-fix=\(s.liveFixEnabled) · триггеры: space=\(s.triggerSpace) enter=\(s.triggerEnter) tab=\(s.triggerTab)
         \(hk)
@@ -368,6 +452,56 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
             out += "\n(лог пуст или недоступен)"
         }
         return out
+    }
+
+    /// Строка «хоткеи:» диагностики отзыва. Отдельной функцией, чтобы стенд
+    /// (Tools/HotkeyClashSim.swift) проверял её без остального снимка: лога, доступов, микрофона.
+    static func hotkeysDiagnosticsLine() -> String {
+        "хоткеи: " + HotkeyGuard.Slot.allCases.map(hotkeyDiagnostics).joined(separator: " · ")
+    }
+
+    /// Одна позиция строки «хоткеи:» в диагностике отзыва.
+    ///
+    /// ⚠️ ВСЕ ВОСЕМЬ СЛОТОВ, А НЕ ПЯТЬ (26.09.2026, задача 256B). Строка собиралась вручную и знала
+    /// конверсию, диктовку, перевод, мгновенное переключение и вставку диктовки. Сниппеты, вставка
+    /// без форматирования и смена регистра тоже глотают клавиши, но в отзыв не попадали, и на
+    /// письмо «после установки пропало сочетание» нельзя было ответить, не висит ли оно на них.
+    /// Теперь строка идёт по реестру `HotkeyGuard.Slot`, а `switch` без `default` не даст собрать
+    /// приложение с девятым слотом, пока его не впишут сюда.
+    ///
+    /// Ключи ASCII и НЕ из L10n намеренно: `slot.name` зависит от языка интерфейса, а часть отзывов
+    /// приходит с английским. Один и тот же слот должен называться в отчёте одинаково у всех.
+    ///
+    /// Выключенный слот печатает сохранённую комбинацию в скобках, `выкл(mode/kc/mods)`, а не голое
+    /// «выкл». Конфликт чаще всего рождается при повторном включении функции (см.
+    /// `HotkeyGuard.activeClashes`), и увидеть его заранее можно только по тому, что лежит в
+    /// настройках. «Выключен» значит то же, что для перехватчика: у перевода это `translateEnabled`,
+    /// хотя проверка конфликтов держит его комбинацию занятой всегда.
+    private static func hotkeyDiagnostics(_ slot: HotkeyGuard.Slot) -> String {
+        let s = AppSettings.shared
+        let c: (key: String, on: Bool, mode: String, keyCode: Int, mods: UInt64, tail: String)
+        switch slot {
+        case .convert:
+            c = ("convert", true, s.hotkeyMode, s.hotkeyKeyCode, s.hotkeyModifiers, "")
+        case .voice:
+            c = ("voice", s.voiceEnabled, s.voiceHotkeyMode, s.voiceHotkeyKeyCode, s.voiceHotkeyModifiers,
+                 " (hold=\(s.voiceHoldMode))")
+        case .translate:
+            c = ("translate", s.translateEnabled, "key", s.translateHotkeyKeyCode, s.translateHotkeyModifiers, "")
+        case .instant:
+            c = ("instant", s.instantSwitchEnabled, s.instantSwitchMode, s.instantSwitchKeyCode, s.instantSwitchMods, "")
+        case .snippet:
+            c = ("snippet", s.snippetPickEnabled, "key", s.snippetPickKeyCode, s.snippetPickModifiers, "")
+        case .plainPaste:
+            c = ("plainPaste", s.plainPaste, "key", s.plainPasteKeyCode, s.plainPasteModifiers, "")
+        case .caseChange:
+            c = ("caseChange", s.caseChangeEnabled, "key", s.caseChangeKeyCode, s.caseChangeModifiers, "")
+        case .pasteDictation:
+            c = ("pasteDictation", s.pasteDictationEnabled, "key", s.pasteDictationKeyCode,
+                 s.pasteDictationModifiers, "")
+        }
+        let combo = "\(c.mode)/\(c.keyCode)/\(c.mods)"
+        return "\(c.key)=" + (c.on ? combo : "выкл(\(combo))") + c.tail
     }
 
     @objc private func showDiag() {
@@ -403,22 +537,33 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
         // и экран «Улетело» обещал бы ответ, которого не будет: в базу контакт не попал.
         sentWithContact = !c.isEmpty
         if diagCheck.state == .on { body["diag"] = Self.buildDiagnostics() }
+        // Файл заявляем в том же JSON (тип и размер), а сам он поедет вторым шагом по токену из
+        // ответа. Снимок берём сейчас, как и контакт: крестик по дороге не должен менять то, что ушло.
+        let sentAttachment = ReleaseFeatures.feedbackAttachments ? attachment : nil
+        if let a = sentAttachment { body["attachment"] = FeedbackAttachmentPolicy.declaration(type: a.type, size: a.size) }
 
-        var req = URLRequest(url: URL(string: "https://keyboop.com/api/feedback")!)
+        var req = URLRequest(url: FeedbackAttachmentPolicy.endpoint)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         req.timeoutInterval = 15
-        URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
             let ok = (resp as? HTTPURLResponse)?.statusCode == 200
-            DispatchQueue.main.async { self?.sendFinished(ok) }
+            let token = ok ? data.flatMap(FeedbackAttachmentPolicy.uploadToken(fromResponse:)) : nil
+            DispatchQueue.main.async { self?.sendFinished(ok, uploadToken: token, attachment: sentAttachment) }
         }.resume()
     }
 
-    private func sendFinished(_ ok: Bool) {
+    private func sendFinished(_ ok: Bool, uploadToken: String?, attachment: (url: URL, type: String, size: Int)?) {
         sendBtn.isEnabled = true
         if ok {
             kbLog("feedback: отправлен (длина только — принцип №2)")
+            if let a = attachment, let token = uploadToken {
+                pendingUpload = (token, a.type, a.url)
+                uploadAttachment()
+                return
+            }
+            if attachment != nil { kbLog("feedback: сервер файл не ждёт, ушёл только текст") }
             showDone(hasContact: sentWithContact)
         } else {
             status.textColor = .systemOrange
@@ -429,6 +574,104 @@ final class FeedbackWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     @objc private func sendMail() { Permissions.openFeedbackMail() }
+
+    /// Второй шаг: сам файл. «Отправить» на это время выключена: текст уже в базе, и повторное
+    /// нажатие дало бы дубль отзыва, а не повтор файла. Для повтора есть своя кнопка.
+    private func uploadAttachment() {
+        guard let u = pendingUpload else { return }
+        sendBtn.isEnabled = false
+        retryBtn.isHidden = true
+        status.textColor = .secondaryLabelColor
+        status.stringValue = L10n.t("fb.sendingFile")
+        let req = FeedbackAttachmentPolicy.uploadRequest(token: u.token, type: u.type)
+        URLSession.shared.uploadTask(with: req, fromFile: u.url) { [weak self] _, resp, _ in
+            let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+            DispatchQueue.main.async { self?.uploadFinished(ok) }
+        }.resume()
+    }
+
+    private func uploadFinished(_ ok: Bool) {
+        if ok {
+            pendingUpload = nil
+            kbLog("feedback: файл ушёл")
+            showDone(hasContact: sentWithContact, withFile: true)
+        } else {
+            status.textColor = .systemOrange
+            status.stringValue = L10n.t("fb.fileFail")
+            retryBtn.isHidden = false
+            kbLog("feedback: файл не дошёл, предложен повтор")
+        }
+    }
+
+    @objc private func retryUpload() { uploadAttachment() }
+
+    // MARK: - Вложение
+
+    @objc private func chooseAttachment() {
+        guard ReleaseFeatures.feedbackAttachments else { return }
+        guard let w = window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.png, .jpeg, .mpeg4Movie, .quickTimeMovie]
+        panel.message = L10n.t("fb.attachHint")
+        panel.beginSheetModal(for: w) { [weak self] r in
+            guard r == .OK, let url = panel.url else { return }
+            self?.attach(url)
+        }
+    }
+
+    private func attach(_ url: URL) {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        switch FeedbackAttachmentPolicy.verdict(fileExtension: url.pathExtension, size: size) {
+        case .ok(let type):
+            attachment = (url, type, size)
+            attachName.stringValue = "\(url.lastPathComponent) · \(Self.humanSize(size))"
+            attachName.isHidden = false
+            attachRemove.isHidden = false
+            status.textColor = .secondaryLabelColor
+            status.stringValue = ""
+            kbLog("feedback: выбран файл \(type), \(size) байт")   // имя файла в лог не пишем
+        case .tooLarge(let limit):
+            status.textColor = .systemOrange
+            status.stringValue = String(format: L10n.t("fb.attachTooLarge"), Self.humanSize(limit))
+        case .unsupported, .empty:
+            status.textColor = .systemOrange
+            status.stringValue = L10n.t("fb.attachBadType")
+        }
+    }
+
+    @objc private func removeAttachment() {
+        attachment = nil
+        attachName.isHidden = true
+        attachRemove.isHidden = true
+        // Файл не дошёл, а человек передумал его повторять: текст уже у нас, показываем «Улетело».
+        if pendingUpload != nil { pendingUpload = nil; showDone(hasContact: sentWithContact) }
+    }
+
+    private static func humanSize(_ n: Int) -> String {
+        FeedbackAttachmentPolicy.humanSize(n, mb: L10n.t("fb.unitMB"), kb: L10n.t("fb.unitKB"))
+    }
+
+    /// DEV-ХУК (`KEYBOOP_FBDUMP=1`, второй снимок): вся форма с выбранным файлом в PNG. Правило
+    /// проекта: то, что видит человек, смотрим в пикселях до релиза. Ряд вложения появился 05.09.2026
+    /// (задача 191), и без снимка его геометрию никто бы не увидел до первой жалобы.
+    func dumpFormForDev(to path: String) {
+        attachName.stringValue = "screenshot.png · \(Self.humanSize(1_234_567))"
+        attachName.isHidden = false
+        attachRemove.isHidden = false
+        guard let form = formContent else { return }
+        form.layoutSubtreeIfNeeded()
+        let b = form.bounds
+        guard b.width > 1, b.height > 1, let rep = form.bitmapImageRepForCachingDisplay(in: b) else {
+            kbLog("FBDUMP: форма пуста"); return
+        }
+        form.cacheDisplay(in: b, to: rep)
+        if let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: path))
+            kbLog("FBDUMP: записан \(path)")
+        }
+    }
 
     /// DEV-ХУК (`KEYBOOP_FBDUMP=1`): напечатать в поле образец и отрисовать сам блок ввода в PNG.
     ///
